@@ -1,0 +1,27 @@
+{
+  "name": "odoo-dc",
+  "version": "0.1.0",
+  "description": "Static explorer for Odoo addons: views, inheritance and composed arches, window actions, Python method chains and access rules, from the command line. No database, no Odoo server.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "odoo-dc": "cli/odoo-dc.mjs"
+  },
+  "exports": {
+    ".": "./lib/engine.js",
+    "./lib/*": "./lib/*"
+  },
+  "files": [
+    "lib/*.js",
+    "cli/*.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": ["odoo", "cli", "xml", "views", "xpath", "static-analysis"],
+  "scripts": {
+    "test": "node --test test/engine.test.mjs test/parse.test.mjs test/python.test.mjs test/python_flow.test.mjs test/security.test.mjs test/cli.test.mjs test/builder.test.mjs"
+  }
+}
