@@ -11,22 +11,24 @@
  * (2 for usage errors). Nothing is swallowed: partial results carry explicit
  * `warnings` / `truncated` / `errors` fields instead.
  */
-import { writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
-import { EngineError, createEngine } from '../lib/engine.js';
+import { CONSOLE_VERSION, EngineError, createEngine } from '../lib/engine.js';
 import { BUILDER_BOOL_FLAGS, BUILDER_USAGE, builderBrief, isBuilderCommand, runBuilder } from './build.mjs';
 
-const USAGE = `odoo-dc <command> [args] [--root <label|path|all>] [--addons <path>]... [--base <dir>] [--limit n] [--refresh] [--format brief]
+const USAGE = `odoo-dc <command> [args] [--root <label|path|all>] [--addons <path>]... [--base <dir>] [--limit n] [--refresh] [--format brief|json|compact] [--fields a,b] [--include-data] [--no-cache]
 
 Lookup commands (read-only, JSON on stdout unless --format brief):
   roots                          list detected addons roots
+  doctor                         versions, roots, index and cache health, skipped files, warnings
   search <query> [--type t]      views by id/model/name/field/file ("res.partner form")
   view <xmlId>                   one view: source, line, fields, xpaths
   compose <xmlId> [--all]        composed arch as XML (base + chain; --all = every inheritor)
-  related <xmlId>                base view, direct inheritors, xpath patches, actions
+  related <xmlId> [--scope root] base view, direct inheritors (every indexed root), xpath patches, actions
   impact <xmlId>                 everything affected by editing a view: all inheritors (transitive,
-                                 cross-root), actions opening it, fields it uses, compose skips
+                                 cross-root, primary/extensions tagged), actions opening it, fields it
+                                 uses, compose skips
   actions [query] [--model m]    window actions
   action <xmlId>                 one window action (domain, context, target views, source)
   field <model> <field>          definition, views showing it, methods reading/writing it
@@ -42,6 +44,10 @@ Lookup commands (read-only, JSON on stdout unless --format brief):
   gate <xmlId>                   view/menu/action trace: gating groups, menu chain, restricted nodes,
                                  each group's permissions on the model   [--scope root = this root only]
   get "<raw query string>"       any read action, e.g. 'action=module&module=sale'
+  batch [--file cmds.json]       run many read commands in one process: a JSON array (or one
+                                 object per line) of {"id","action",...} read from stdin or the
+                                 file; prints one {"id","ok","result"|"brief"} line per item,
+                                 exit 1 when any item failed. Read-only (no builder commands).
 
 Root selection: no --root = first root for search/actions/py*, and view/compose/related/impact/action
 fall back through every root until the id is found. --root <text> = the one root whose label/path/
@@ -49,14 +55,16 @@ kind contains <text>. --root all = every root.
 Roots default to discovery under --base (default $ODOO_DC_BASE, else the current directory);
 --addons <path> (repeatable, or $ODOO_DC_ADDONS colon list) sets them explicitly.
 --format brief prints one line per hit (search, actions, pysearch) or a short text report
-(impact, field, builder). --full keeps wireframe trees (view, compose). --out file writes to a file.
+(view, related, pymethod, impact, field, builder). --full keeps wireframe trees (view, compose).
+--out file writes to a file. compose/impact merge at most 400 views per query; the payload sets
+capped=true and impact warns when the cap (or the 200-child related list) truncates.
 
 ${BUILDER_USAGE}`;
 
 /** Read-only GET actions of the route. `save`, `folders` and POST-only actions are not listed. */
 const READ_ACTIONS = new Set([
   'roots', 'index', 'file', 'module', 'report', 'pyindex', 'pymethod', 'pymodel', 'fields',
-  'search', 'compose', 'related', 'actions', 'action', 'xpath', 'xpathbase', 'secindex', 'sectrace',
+  'search', 'compose', 'related', 'inheritors', 'flows', 'modelflows', 'actions', 'action', 'xpath', 'xpathbase', 'secindex', 'sectrace',
 ]);
 
 /** Route error codes that mean "not in this root", so the next root may have it. */
@@ -69,7 +77,7 @@ const permText = (p) => (p ? `${p.read ? 'R' : '-'}${p.write ? 'W' : '-'}${p.cre
 function parseArgs(argv) {
   const pos = [];
   const flags = new Map();
-  const bool = new Set(['refresh', 'all', 'full', 'help', ...BUILDER_BOOL_FLAGS]);
+  const bool = new Set(['refresh', 'all', 'full', 'help', 'no-cache', 'include-data', 'prune', ...BUILDER_BOOL_FLAGS]);
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg.startsWith('--')) {
@@ -184,24 +192,35 @@ async function impact(engine, roots, xmlId) {
     if (rel.target === null || rel.target === undefined) throw Object.assign(new Error(`view ${xmlId} not found in root ${r.label}`), { exitCode: 1, code: 'unknown-view' });
     return rel;
   });
-  const [composed, own] = await Promise.all([
-    get(engine, `action=compose&root=${enc(root.id)}&xmlId=${enc(xmlId)}&mode=all`),
-    viewInRoot(engine, root, xmlId),
+  const owner = roots.find((candidate) => candidate.id === value.targetRootId) ?? root;
+  const [composed, own, inherited] = await Promise.all([
+    get(engine, `action=compose&root=${enc(owner.id)}&xmlId=${enc(xmlId)}&mode=all`),
+    viewInRoot(engine, owner, xmlId),
+    get(engine, `action=inheritors&root=${enc(owner.id)}&xmlId=${enc(xmlId)}`),
   ]);
   const skipped = composed.skipped ?? [];
   const warnings = [];
   if (skipped.length > 0 || composed.skippedTotal > 0) warnings.push(`compose skipped ${composed.skippedTotal ?? skipped.length} operation(s); inheritor content may be missing from the merged arch`);
   if (composed.complete !== true) warnings.push('compose reported complete=false');
   if (composed.truncated) warnings.push('compose was truncated');
+  if (composed.capped) warnings.push('compose stopped at its 400-view cap; the merged arch is incomplete (the inheritor list is complete)');
+  if (inherited.capped) warnings.push('inheritor list capped at 1000; raise MAX_INHERITORS to see the rest');
+  if ((value.duplicateChildren ?? 0) > 0) warnings.push(`${value.duplicateChildren} duplicate module copy(ies) collapsed to one xml id; the child paths list every copy`);
+  if ((value.childrenTotal ?? 0) > (value.children ?? []).length) warnings.push(`direct inheritor list capped at ${(value.children ?? []).length} of ${value.childrenTotal}; childrenTotal has the real count`);
+  if ((inherited.skippedDataFiles ?? 0) > 0) warnings.push(`${inherited.skippedDataFiles} data/demo XML file(s) are outside the view index; views declared there are not listed`);
+  if (composed.indexHealth?.truncated) warnings.push('the view index for this root hit maxFiles; results can be incomplete');
+  if ((composed.indexHealth?.failed ?? 0) > 0) warnings.push(`${composed.indexHealth.failed} view file(s) in this root failed to parse`);
   return {
     xmlId,
-    root: root.label,
+    root: owner.label,
     model: value.target.model,
     type: value.target.type,
     file: `${value.target.file}:${value.target.line}`,
+    rootId: value.targetRootId ?? root.id,
     parent: value.parent?.xmlId ?? null,
     directInheritors: (value.children ?? []).map((c) => c.xmlId),
-    allInheritors: (composed.views ?? []).filter((v) => v.xmlId !== xmlId).map((v) => ({ xmlId: v.xmlId, module: v.module, priority: v.priority, file: v.file })),
+    directInheritorsTotal: value.childrenTotal ?? (value.children ?? []).length,
+    allInheritors: (inherited.inheritors ?? []).map((v) => ({ xmlId: v.xmlId, module: v.module, priority: v.priority, mode: v.mode, file: v.file })),
     actions: (value.actions ?? []).map((a) => ({ xmlId: a.xmlId, name: a.name })),
     actionsTotal: value.actionsTotal ?? (value.actions ?? []).length,
     fields: own.view.fields ?? [],
@@ -211,20 +230,15 @@ async function impact(engine, roots, xmlId) {
 }
 
 /** True when a flow field name is the field itself or a path through it (`order_line.price_total`). */
-const touches = (name, field) => name === field || name.startsWith(`${field}.`);
-
 /** `field`: where a model field is defined, shown and used. */
 async function fieldReport(engine, roots, model, field, flags) {
   const num = (k, d) => { const v = Number.parseInt(flags.get(k)?.at(-1) ?? '', 10); return Number.isFinite(v) && v > 0 ? v : d; };
   const maxFiles = num('max-files', 60);
-  const maxMethods = num('max-methods', 200);
+  const requestedMethods = Number.parseInt(flags.get('max-methods')?.at(-1) ?? '', 10);
   const first = roots[0];
-  const pm = await get(engine, `action=pymodel&root=${enc(first.id)}&model=${enc(model)}`);
-  const def = (pm.fields ?? []).find((f) => f.name === field);
-  if (def === undefined) {
-    const near = (pm.fields ?? []).map((f) => f.name).filter((n) => n.includes(field) || field.includes(n)).slice(0, 8);
-    throw Object.assign(new Error(`field ${field} is not defined on ${model}${near.length > 0 ? ` (similar: ${near.join(', ')})` : ''}`), { exitCode: 1, code: 'unknown-field' });
-  }
+  const methodLimit = Number.isFinite(requestedMethods) && requestedMethods > 0 ? `&maxMethods=${enc(String(requestedMethods))}` : '';
+  // One scoped pass: field definition plus the flow of every method of the model.
+  const flowReport = await get(engine, `action=modelflows&root=${enc(first.id)}&model=${enc(model)}&field=${enc(field)}${methodLimit}`);
 
   // Views: search each root by "<model> <field>", then confirm the field is in the view arch.
   const views = [];
@@ -254,38 +268,28 @@ async function fieldReport(engine, roots, model, field, flags) {
     }
   }
 
-  // Methods: read the flow of each method of the model and keep those touching the field.
-  const methods = [];
-  const methodErrors = [];
-  const names = [...new Set((pm.methods ?? []).map((m) => m.name))];
-  const methodsTruncated = names.length > maxMethods;
-  for (const name of names.slice(0, maxMethods)) {
-    try {
-      const m = await get(engine, `action=pymethod&root=${enc(first.id)}&model=${enc(model)}&name=${enc(name)}`);
-      const roles = new Set();
-      for (const f of m.flow?.fields ?? []) if (touches(f.name, field)) roles.add(f.source === 'depends' ? 'depends' : 'read');
-      for (const w of m.flow?.outputs?.writes ?? []) if (touches(w.name, field)) roles.add('write');
-      if (roles.size > 0) {
-        const step = m.chain?.[(m.selectedStep ?? 1) - 1] ?? m.chain?.[0];
-        methods.push({ name, roles: [...roles], module: step?.module, file: step ? `${step.file}:${step.line}` : undefined });
-      }
-    } catch (error) {
-      methodErrors.push({ method: name, error: error.message });
-    }
-  }
+  const methods = (flowReport.methods ?? []).map((row) => ({ name: row.name, roles: row.roles, module: row.module, file: `${row.file}:${row.line}` }));
 
   const warnings = [];
   if (viewsTruncated) warnings.push(`view search truncated (max ${maxFiles} files); raise --max-files`);
-  if (methodsTruncated) warnings.push(`only ${maxMethods} of ${names.length} methods analysed; raise --max-methods`);
-  warnings.push('method roles come from static flow analysis (no dynamic access, no helper following)');
+  if (flowReport.truncated) warnings.push(`only ${flowReport.analysed} of ${flowReport.total} methods analysed; raise --max-methods`);
+  for (const warning of flowReport.warnings ?? []) warnings.push(warning);
   return {
     model,
     field,
-    definition: { fieldType: def.fieldType, comodel: def.comodel, string: def.string, attrs: def.attrs, module: def.module, file: `${def.file}:${def.line}`, definitions: def.definitions },
-    computeMethod: def.attrs?.compute ?? null,
+    definition: {
+      fieldType: flowReport.definition.fieldType,
+      comodel: flowReport.definition.comodel,
+      string: flowReport.definition.string,
+      attrs: flowReport.definition.attrs,
+      module: flowReport.definition.module,
+      file: `${flowReport.definition.file}:${flowReport.definition.line}`,
+      definitions: flowReport.definition.definitions,
+    },
+    computeMethod: flowReport.computeMethod ?? null,
     views,
     methods,
-    errors: [...viewErrors, ...methodErrors],
+    errors: viewErrors,
     warnings,
   };
 }
@@ -317,6 +321,36 @@ function toBrief(cmd, r) {
     for (const m of r.methods) lines.push(`  ${m.name}\t${m.roles.join('+')}\t${m.file ?? ''}`);
     for (const e of r.errors) lines.push(`ERROR ${e.file ?? e.method}: ${e.error}`);
     for (const w of r.warnings) lines.push(`WARNING ${w}`);
+  } else if (cmd === 'view') {
+    const v = r.view ?? {};
+    lines.push(`${v.xmlId}  [${v.type ?? '?'}${v.mode === 'extension' ? ' ext' : ''}] ${v.model || '(no model)'}  ${r.file?.file ?? ''}:${v.line ?? ''}  (${r.root ?? ''})`);
+    lines.push(`inherit: ${v.inheritId || '-'}  priority: ${v.priority || '-'}  fields: ${(v.fields ?? []).length}  xpaths: ${(v.xpaths ?? []).length}`);
+    if ((v.fields ?? []).length > 0) lines.push(`fields: ${(v.fields ?? []).slice(0, 80).join(', ')}`);
+    const acts = r.actions ?? [];
+    lines.push(`actions (${acts.length}): ${acts.slice(0, 10).map((a) => a.xmlId).join(', ') || '-'}${acts.length > 10 ? ', …' : ''}`);
+  } else if (cmd === 'doctor') {
+    lines.push(`odoo-dc ${r.odooDc}  console ${r.consoleVersion}  ${r.node}  base ${r.base}`);
+    for (const workspace of r.workspaces ?? []) lines.push(`workspace ${workspace.path}  odoo ${workspace.version ?? 'unknown'}`);
+    lines.push(`roots (${r.roots.length}):`);
+    for (const row of r.roots) {
+      lines.push(`  ${row.label}\t${row.path}\tfiles ${row.stats.files}\tviews ${row.stats.views}\tactions ${row.stats.actions}\tmodules ${row.stats.modules}\tskippedData ${row.stats.skippedData}`);
+    }
+    lines.push(`totals: files ${r.totals.files}  views ${r.totals.views}  actions ${r.totals.actions}  modules ${r.totals.modules}`);
+    lines.push(`cache: ${r.cache.dir}  ${r.cache.enabled ? 'on' : 'off'}  ${r.cache.files} file(s)  ${(r.cache.bytes / 1048576).toFixed(1)} MB  (view ${r.cache.viewFiles}, python ${r.cache.pyFiles})`);
+    if (r.cache.pruned.files > 0) lines.push(`pruned: ${r.cache.pruned.files} file(s)  ${(r.cache.pruned.bytes / 1048576).toFixed(1)} MB`);
+    for (const warning of r.warnings) lines.push(`WARNING ${warning}`);
+  } else if (cmd === 'related') {
+    const tgt = r.target ?? {};
+    lines.push(`${tgt.xmlId}  [${tgt.type ?? '?'}] ${tgt.model || '(no model)'}  ${tgt.file}:${tgt.line}`);
+    lines.push(`parent: ${r.parent?.xmlId ?? '-'}`);
+    lines.push(`children (${r.childrenTotal}${(r.children ?? []).length < r.childrenTotal ? `, showing ${(r.children ?? []).length}` : ''}): ${(r.children ?? []).map((c) => c.xmlId).join(', ') || '-'}`);
+    lines.push(`actions (${r.actionsTotal}): ${(r.actions ?? []).map((a) => a.xmlId).join(', ') || '-'}`);
+  } else if (cmd === 'pymethod') {
+    lines.push(`${r.model}.${r.name}  chain=${(r.chain ?? []).length}  selected=${r.selectedStep}`);
+    for (const step of r.chain ?? []) {
+      lines.push(`  ${step.step}\t${step.module}\t${step.file}:${step.line}\tsuper=${step.hasSuper ? 'y' : 'n'}${step.isBase ? ' base' : ''}${step.brokenChain && step.isBase !== true ? ' BROKEN' : ''}`);
+    }
+    for (const w of r.warnings ?? []) lines.push(`WARNING ${w}`);
   } else if (cmd === 'access') {
     for (const i of r.items ?? []) lines.push([i.kind === 'artifact' ? i.artifact : i.kind, i.id, i.name !== i.id ? i.name : '', i.detail].join('\t'));
     if (r.truncated) lines.push(`… ${r.total} total`);
@@ -355,6 +389,324 @@ function toBrief(cmd, r) {
   return `${lines.join('\n')}\n`;
 }
 
+/** Detect the Odoo version of one workspace (`<ws>/odoo/odoo/release.py` first). */
+function detectWorkspaceVersion(workspace) {
+  for (const rel of ['odoo/odoo/release.py', 'odoo/release.py', 'release.py']) {
+    try {
+      const text = readFileSync(join(workspace, rel), 'utf8');
+      const match = /version_info\s*=\s*\((\d+),\s*(\d+)/.exec(text);
+      if (match !== null) return Number(`${match[1]}.${match[2]}`);
+    } catch {
+      // try the next layout
+    }
+  }
+  return null;
+}
+
+/** The `--format` choice: `json` (pretty, default), `compact` or `brief`. */
+function formatChoice() {
+  const i = process.argv.indexOf('--format');
+  if (i < 0) return 'json';
+  const value = process.argv[i + 1];
+  if (value !== 'brief' && value !== 'json' && value !== 'compact') throw usage('--format must be brief, json or compact');
+  return value;
+}
+
+/**
+ * Health report: versions, roots, index stats, cache state and blind spots.
+ * @param {object} engine - engine facade.
+ * @param {Array<object>} roots - discovered roots.
+ * @param {string} base - resolved base directory.
+ * @returns {Promise<object>} doctor payload.
+ */
+async function doctorReport(engine, roots, base, flags = new Map()) {
+  const workspaceVersions = new Map();
+  for (const root of roots) {
+    if (typeof root.workspace === 'string' && root.workspace.length > 0 && !workspaceVersions.has(root.workspace)) {
+      workspaceVersions.set(root.workspace, detectWorkspaceVersion(root.workspace));
+    }
+  }
+  const rows = [];
+  const totals = { files: 0, views: 0, actions: 0, modules: 0, skippedData: 0, failed: 0, truncatedRoots: 0 };
+  for (const root of roots) {
+    const payload = await get(engine, `action=index&root=${enc(root.id)}`);
+    const stats = payload.stats ?? {};
+    rows.push({
+      id: root.id,
+      label: root.label,
+      path: root.path,
+      kind: root.kind,
+      workspace: root.workspace ?? '',
+      stats: {
+        files: stats.files ?? 0,
+        views: stats.views ?? 0,
+        actions: stats.actions ?? 0,
+        modules: stats.modules ?? 0,
+        candidates: stats.candidateFiles ?? 0,
+        skippedData: stats.skippedData ?? 0,
+        failed: stats.failed ?? 0,
+        truncated: stats.truncated === true,
+        builtAt: stats.builtAt ?? '',
+      },
+    });
+    for (const key of ['files', 'views', 'actions', 'modules', 'skippedData', 'failed']) totals[key] += rows[rows.length - 1].stats[key];
+    if (rows[rows.length - 1].stats.truncated) totals.truncatedRoots += 1;
+  }
+  const options = engine.state.options;
+  const cache = { dir: options.cacheDir, enabled: options.diskCache === true, files: 0, bytes: 0, viewFiles: 0, viewBytes: 0, pyFiles: 0, pyBytes: 0 };
+  const pruneDays = Number.parseInt(flags.get('prune-days')?.at(-1) ?? '30', 10);
+  const pruneBefore = Date.now() - (Number.isFinite(pruneDays) && pruneDays >= 0 ? pruneDays : 30) * 86_400_000;
+  const pruned = { files: 0, bytes: 0 };
+  try {
+    for (const name of readdirSync(cache.dir)) {
+      let info;
+      try {
+        info = statSync(join(cache.dir, name));
+      } catch {
+        continue;
+      }
+      if (flags.has('prune') && info.mtimeMs < pruneBefore) {
+        try {
+          unlinkSync(join(cache.dir, name));
+          pruned.files += 1;
+          pruned.bytes += info.size;
+          continue;
+        } catch {
+          // a file that cannot be removed is simply kept
+        }
+      }
+      cache.files += 1;
+      cache.bytes += info.size;
+      if (name.startsWith('py-')) {
+        if (name.endsWith('.bin')) cache.pyFiles += 1;
+        cache.pyBytes += info.size;
+      } else if (name.endsWith('.json')) {
+        cache.viewFiles += 1;
+        cache.viewBytes += info.size;
+      }
+    }
+  } catch {
+    // No cache directory yet: report the configured path with zero files.
+  }
+  const warnings = [];
+  if (totals.truncatedRoots > 0) warnings.push(`${totals.truncatedRoots} root(s) hit maxFiles; the index is incomplete`);
+  if (totals.failed > 0) warnings.push(`${totals.failed} view file(s) failed to parse`);
+  if (totals.skippedData > 0) warnings.push(`${totals.skippedData} data/demo XML file(s) are outside the view index; views declared there read as unknown-view`);
+  if (!cache.enabled) warnings.push('the disk cache is off; every run rebuilds the index');
+  let version = 'unknown';
+  try {
+    version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version ?? 'unknown';
+  } catch {
+    // a package without a version still reports the console version
+  }
+  return {
+    odooDc: version,
+    consoleVersion: CONSOLE_VERSION,
+    node: process.version,
+    base,
+    workspaces: [...workspaceVersions.entries()].map(([path, odooVersion]) => ({ path, version: odooVersion })),
+    roots: rows,
+    totals,
+    cache: { ...cache, pruned },
+    warnings,
+  };
+}
+
+/** Not-found error codes: these exit 3 so scripts can tell "absent" from "failed". */
+const NOT_FOUND_CODES = new Set(['unknown-view', 'unknown-model', 'unknown-action', 'unknown-file', 'unknown-field', 'unknown-method', 'unknown-group', 'unknown-root']);
+
+/**
+ * Merge index-health flags of several root searches.
+ * @param {Array<object>} parts - per-root search payloads.
+ * @returns {{ indexHealth: { truncated: boolean, failed: number } }} merged health.
+ */
+function searchHealth(parts) {
+  const failed = parts.reduce((total, part) => total + (part.indexHealth?.failed ?? 0), 0);
+  return {
+    indexHealth: {
+      truncated: parts.some((part) => part.indexHealth?.truncated === true || part.truncated === true),
+      failed,
+    },
+  };
+}
+
+/**
+ * Add the schema version and apply `--fields` to one JSON result.
+ * @param {object} result - command result.
+ * @returns {object} projected result.
+ */
+function projectResult(result, allowFields = true) {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return result;
+  const withSchema = { schemaVersion: 1, ...result };
+  if (!allowFields) return withSchema;
+  const i = process.argv.indexOf('--fields');
+  if (i < 0) return withSchema;
+  const keys = String(process.argv[i + 1] ?? '').split(',').map((key) => key.trim()).filter(Boolean);
+  if (keys.length === 0) return withSchema;
+  const picked = { schemaVersion: 1 };
+  for (const key of keys) if (key in withSchema) picked[key] = withSchema[key];
+  return picked;
+}
+
+/** Read all of stdin as UTF-8 text. */
+async function readStdin() {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/**
+ * Parse a batch payload: a JSON array of items, or one JSON object per line.
+ * @param {string} text - raw stdin or file contents.
+ * @returns {Array<object>} items.
+ */
+function parseBatchItems(text) {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return [];
+  if (trimmed.startsWith('[')) {
+    const parsed = JSON.parse(trimmed);
+    if (!Array.isArray(parsed)) throw usage('batch: the JSON payload must be an array');
+    return parsed;
+  }
+  return trimmed.split(/\r?\n/)
+    .filter((line) => line.trim().length > 0)
+    .map((line, index) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        throw usage(`batch: line ${index + 1} is not JSON`);
+      }
+    });
+}
+
+/**
+ * Map one batch item to CLI positionals.
+ * @param {object} item - `{ action, ... }`.
+ * @returns {string[]} command plus positional arguments.
+ */
+function batchArgv(item) {
+  const action = typeof item.action === 'string' ? item.action.trim() : '';
+  if (action.length === 0) throw usage('batch: every item needs an action');
+  if (action === 'build' || item.new === true || item.add === true || isBuilderCommand(action, ['new'])) {
+    throw usage(`batch is read-only; "${action}" is a builder command`);
+  }
+  const argv = [action];
+  const push = (value) => {
+    if (value !== undefined && value !== null && value !== '') argv.push(String(value));
+  };
+  switch (action) {
+    case 'roots':
+      break;
+    case 'search':
+    case 'pysearch':
+    case 'actions':
+    case 'access':
+      push(item.q ?? item.query);
+      break;
+    case 'view':
+    case 'compose':
+    case 'related':
+    case 'impact':
+    case 'action':
+    case 'group':
+    case 'gate':
+    case 'inheritors':
+      push(item.xmlId);
+      break;
+    case 'field':
+      push(item.model);
+      push(item.field);
+      break;
+    case 'pymodel':
+    case 'acl':
+      push(item.model);
+      break;
+    case 'pymethod':
+      push(item.model);
+      push(item.name);
+      break;
+    case 'get':
+      push(item.query ?? item.q);
+      break;
+    default:
+      throw usage(`batch: unknown action "${action}"`);
+  }
+  return argv;
+}
+
+/**
+ * Flags for one batch item; a global `--root` is the default.
+ * @param {object} item - batch item.
+ * @param {Map<string, string[]>} globals - flags of the batch invocation.
+ * @returns {Map<string, string[]>} per-item flags.
+ */
+function batchFlags(item, globals) {
+  const flags = new Map();
+  const add = (key, value) => {
+    if (value !== undefined && value !== null && value !== '') flags.set(key, [...(flags.get(key) ?? []), String(value)]);
+  };
+  add('root', item.root ?? globals.get('root')?.at(-1));
+  add('limit', item.limit);
+  add('type', item.type);
+  add('scope', item.scope);
+  add('model', item.model);
+  add('step', item.step);
+  add('max-methods', item.maxMethods ?? item['max-methods']);
+  add('max-files', item.maxFiles ?? item['max-files']);
+  if (item.all === true) flags.set('all', ['1']);
+  if (item.full === true) flags.set('full', ['1']);
+  if (item.refresh === true) flags.set('refresh', ['1']);
+  return flags;
+}
+
+/**
+ * Run many read commands in one process, one NDJSON line per item.
+ * @param {object} engine - engine facade.
+ * @param {string} base - resolved base directory.
+ * @param {Map<string, string[]>} flags - flags of the batch invocation.
+ * @returns {Promise<void>} resolves when every line is written.
+ */
+async function runBatch(engine, base, flags) {
+  const file = flags.get('file')?.at(-1);
+  let text;
+  if (file !== undefined) {
+    try {
+      text = readFileSync(file, 'utf8');
+    } catch (error) {
+      throw usage(`batch: cannot read ${file}: ${error.message}`);
+    }
+  } else {
+    text = await readStdin();
+  }
+  const items = parseBatchItems(text);
+  const globalBrief = wantsBrief();
+  let failures = 0;
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    const id = item !== null && typeof item === 'object' && (typeof item.id === 'string' || typeof item.id === 'number') ? item.id : index + 1;
+    const started = Date.now();
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+      failures += 1;
+      process.stdout.write(`${JSON.stringify({ id, ok: false, error: { code: 'bad-item', message: 'batch item must be an object' } })}\n`);
+      continue;
+    }
+    try {
+      const argv = batchArgv(item);
+      const out = await runCommand(engine, base, argv[0], argv.slice(1), batchFlags(item, flags));
+      const brief = item.format === 'brief' || (item.format === undefined && globalBrief);
+      const textOut = brief ? (out.builder ? builderBrief(out.result) : toBrief(out.cmd, out.result)) : null;
+      const line = textOut === null
+        ? { id, ok: true, ms: Date.now() - started, result: out.result }
+        : { id, ok: true, ms: Date.now() - started, brief: textOut };
+      process.stdout.write(`${JSON.stringify(line)}\n`);
+    } catch (error) {
+      failures += 1;
+      process.stdout.write(`${JSON.stringify({ id, ok: false, ms: Date.now() - started, error: { code: error.code ?? 'failed', message: error.message } })}\n`);
+    }
+  }
+  if (failures > 0) process.exitCode = 1;
+}
+
 async function main() {
   const { pos, flags } = parseArgs(process.argv.slice(2));
   if (flags.has('help') || pos.length === 0) {
@@ -364,8 +716,26 @@ async function main() {
   const one = (k) => flags.get(k)?.at(-1);
   const base = resolve(one('base') ?? process.env.ODOO_DC_BASE ?? process.cwd());
   const addons = [...(flags.get('addons') ?? []), ...(process.env.ODOO_DC_ADDONS ?? '').split(':').filter(Boolean)].map((p) => resolve(p));
-  const engine = createEngine({ base, roots: addons });
+  const engine = createEngine({ base, roots: addons, diskCache: !flags.has('no-cache'), includeData: flags.has('include-data') });
   const [cmd, ...args] = pos;
+  if (cmd === 'batch') {
+    await runBatch(engine, base, flags);
+    return undefined;
+  }
+  return runCommand(engine, base, cmd, args, flags);
+}
+
+/**
+ * Execute one read command against an existing engine.
+ * @param {object} engine - engine facade.
+ * @param {string} base - resolved base directory (builder version detection).
+ * @param {string} cmd - command name.
+ * @param {string[]} args - positional arguments.
+ * @param {Map<string, string[]>} flags - parsed flags.
+ * @returns {Promise<object>} `{ cmd, result }` (plus `builder` for builder commands).
+ */
+async function runCommand(engine, base, cmd, args, flags) {
+  const one = (k) => flags.get(k)?.at(-1);
 
   const rootsPayload = await get(engine, 'action=roots');
   if (cmd === 'roots') return { cmd, result: rootsPayload };
@@ -400,14 +770,22 @@ async function main() {
   }
 
   switch (cmd) {
+    case 'doctor': return wrap(await doctorReport(engine, allRoots, base, flags));
     case 'search': {
       need(1, '<query>');
+      const query = args.join(' ');
       if (want === 'all') {
         const parts = [];
-        for (const root of roots) parts.push(await searchRoot(engine, roots, root, args.join(' '), one('type'), refresh));
-        return wrap({ items: parts.flatMap((p) => p.items ?? []), truncated: parts.some((p) => p.truncated), roots: roots.map((x) => x.label) });
+        for (const root of roots) parts.push(await searchRoot(engine, roots, root, query, one('type'), refresh));
+        return wrap({ ...searchHealth(parts), items: parts.flatMap((p) => p.items ?? []), truncated: parts.some((p) => p.truncated), roots: roots.map((x) => x.label) });
       }
-      return wrap(await searchRoot(engine, roots, picked, args.join(' '), one('type'), refresh));
+      const first = await searchRoot(engine, roots, picked, query, one('type'), refresh);
+      if ((first.items ?? []).length === 0 && want === undefined && roots.length > 1) {
+        const parts = [];
+        for (const root of roots) parts.push(await searchRoot(engine, roots, root, query, one('type'), refresh));
+        return wrap({ ...searchHealth(parts), items: parts.flatMap((p) => p.items ?? []), truncated: parts.some((p) => p.truncated), roots: roots.map((x) => x.label), fallback: true });
+      }
+      return wrap(first);
     }
     case 'view': {
       need(1, '<xmlId>');
@@ -423,21 +801,48 @@ async function main() {
     case 'related': {
       need(1, '<xmlId>');
       const { root, value } = await firstRootWith(lookup, `view ${args[0]}`, async (x) => {
-        const rel = await get(engine, `action=related&root=${enc(x.id)}&xmlId=${enc(args[0])}`);
+        const rel = await get(engine, `action=related&root=${enc(x.id)}&xmlId=${enc(args[0])}${scopeParam}`);
         if (rel.target === null || rel.target === undefined) throw Object.assign(new Error(`view ${args[0]} not found in root ${x.label}`), { exitCode: 1, code: 'unknown-view' });
         return rel;
       });
-      return wrap({ rootUsed: root.label, ...value });
+      const owner = roots.find((candidate) => candidate.id === value.targetRootId) ?? root;
+      return wrap({ rootUsed: owner.label, ...value });
     }
     case 'impact': need(1, '<xmlId>'); return wrap(await impact(engine, lookup, args[0]));
-    case 'actions': return wrap(await get(engine, `action=actions&${r}&q=${enc(args.join(' '))}${one('model') ? `&model=${enc(one('model'))}` : ''}${limit}`));
+    case 'actions': {
+      const query = args.join(' ');
+      const fetchActions = (target) => get(engine, `action=actions&root=${enc(target.id)}&q=${enc(query)}${one('model') ? `&model=${enc(one('model'))}` : ''}${limit}`);
+      const first = await fetchActions(picked);
+      if ((first.items ?? []).length === 0 && want === undefined && roots.length > 1) {
+        const items = [];
+        let truncated = false;
+        for (const target of roots) {
+          const part = await fetchActions(target);
+          items.push(...(part.items ?? []));
+          if (part.truncated) truncated = true;
+        }
+        return wrap({ ...first, items, total: items.length, truncated, roots: roots.map((x) => x.label), fallback: true });
+      }
+      return wrap(first);
+    }
     case 'action': {
       need(1, '<xmlId>');
       const { root, value } = await firstRootWith(lookup, `action ${args[0]}`, (x) => get(engine, `action=action&root=${enc(x.id)}&xmlId=${enc(args[0])}`));
       return wrap({ rootUsed: root.label, ...value });
     }
     case 'field': need(2, '<model> <field>'); return wrap(await fieldReport(engine, roots, args[0], args[1], flags));
-    case 'pysearch': need(1, '<query>'); return wrap(await get(engine, `action=pyindex&${r}&q=${enc(args.join(' '))}${one('type') ? `&type=${enc(one('type'))}` : ''}${limit}${refresh}`));
+    case 'pysearch': {
+      need(1, '<query>');
+      const query = args.join(' ');
+      const fetchPy = (target) => get(engine, `action=pyindex&root=${enc(target.id)}&q=${enc(query)}${one('type') ? `&type=${enc(one('type'))}` : ''}${limit}${refresh}`);
+      const first = await fetchPy(picked);
+      if ((first.items ?? []).length === 0 && want === undefined && roots.length > 1) {
+        const items = [];
+        for (const target of roots) items.push(...((await fetchPy(target)).items ?? []));
+        return wrap({ ...first, items, total: items.length, roots: roots.map((x) => x.label), fallback: true });
+      }
+      return wrap(first);
+    }
     case 'pymodel': need(1, '<model>'); return wrap(await get(engine, `action=pymodel&${r}&model=${enc(args[0])}`));
     case 'pymethod': need(2, '<model> <name>'); return wrap(await get(engine, `action=pymethod&${r}&model=${enc(args[0])}&name=${enc(args[1])}${one('step') ? `&step=${enc(one('step'))}` : ''}`));
     case 'access': return wrap(await get(engine, `action=secindex&${r}&q=${enc(args.join(' '))}${one('type') ? `&type=${enc(one('type'))}` : ''}${limit}${scopeParam}${refresh}`));
@@ -457,11 +862,7 @@ function outPath() {
 
 /** @returns {boolean} true when `--format brief` was given. */
 function wantsBrief() {
-  const i = process.argv.indexOf('--format');
-  if (i < 0) return false;
-  const value = process.argv[i + 1];
-  if (value !== 'brief' && value !== 'json') throw usage('--format must be brief or json');
-  return value === 'brief';
+  return formatChoice() === 'brief';
 }
 
 // A closed pipe (`| head`) is the reader's choice, not a failure.
@@ -472,8 +873,10 @@ process.stdout.on('error', (error) => {
 
 main().then((out) => {
   if (out === undefined) return;
-  const brief = wantsBrief() ? (out.builder ? builderBrief(out.result) : toBrief(out.cmd, out.result)) : null;
-  const text = brief ?? `${JSON.stringify(out.result, null, 2)}\n`;
+  const format = formatChoice();
+  const brief = format === 'brief' ? (out.builder ? builderBrief(out.result) : toBrief(out.cmd, out.result)) : null;
+  const projected = projectResult(out.result, !out.builder);
+  const text = brief ?? (format === 'compact' ? `${JSON.stringify(projected)}\n` : `${JSON.stringify(projected, null, 2)}\n`);
   const target = outPath();
   if (target !== undefined) {
     writeFileSync(target, text);
@@ -481,5 +884,5 @@ main().then((out) => {
   } else process.stdout.write(text);
 }).catch((error) => {
   process.stderr.write(`${JSON.stringify({ error: error.code ?? 'failed', message: error.message, status: error.status, ...(error.details ?? {}) })}\n`);
-  process.exitCode = error.exitCode ?? 1;
+  process.exitCode = NOT_FOUND_CODES.has(error.code) ? 3 : error.exitCode ?? 1;
 });

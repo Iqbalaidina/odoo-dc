@@ -68,7 +68,7 @@ class Thing(models.Model):
 after(() => rmSync(base, { recursive: true, force: true }));
 
 function run(...args) {
-  const r = spawnSync(process.execPath, [CLI, '--addons', addons, '--addons', coreAddons, '--base', base, ...args], { encoding: 'utf8' });
+  const r = spawnSync(process.execPath, [CLI, '--addons', addons, '--addons', coreAddons, '--base', base, ...args], { encoding: 'utf8', env: { ...process.env, ODOO_DC_CACHE: '0' } });
   return { code: r.status, out: r.stdout, err: r.stderr };
 }
 
@@ -94,9 +94,9 @@ test('compose emits merged XML including the inheritor patch', () => {
   assert.equal(j.composed, undefined);
 });
 
-test('errors: unknown view exits 1, bad usage exits 2, both JSON on stderr', () => {
+test('errors: unknown view exits 3, bad usage exits 2, both JSON on stderr', () => {
   const missing = run('view', 'acme.nope');
-  assert.equal(missing.code, 1);
+  assert.equal(missing.code, 3);
   assert.equal(JSON.parse(missing.err).error, 'unknown-view');
   const bad = run('bogus');
   assert.equal(bad.code, 2);
@@ -116,7 +116,7 @@ test('root fallback: id from the second root is found without --root, pinned roo
   const found = JSON.parse(run('view', 'coremod.core_form').out);
   assert.match(found.root, /core-addons/);
   const pinned = run('view', 'coremod.core_form', '--root', 'custom-addons');
-  assert.equal(pinned.code, 1);
+  assert.equal(pinned.code, 3);
   assert.equal(JSON.parse(pinned.err).error, 'unknown-view');
   const none = run('view', 'zzz.nope');
   assert.match(JSON.parse(none.err).message, /roots tried: .*custom-addons.*core-addons/);
@@ -148,7 +148,7 @@ test('field: definition, views and read/write/depends methods', () => {
   assert.deepEqual(roles.action_reset, ['write']);
   assert.equal(JSON.parse(run('field', 'acme.thing', 'total').out).computeMethod, '_compute_total');
   const bad = run('field', 'acme.thing', 'nope');
-  assert.equal(bad.code, 1);
+  assert.equal(bad.code, 3);
   assert.equal(JSON.parse(bad.err).error, 'unknown-field');
 });
 
@@ -203,7 +203,7 @@ test('access commands: search, group, acl and gate traces (read-only, json and b
   assert.match(run('acl', 'acme.thing', '--format', 'brief').out, /acme\.group_user\s+R---/);
 
   const missing = run('group', 'acme.nope');
-  assert.equal(missing.code, 1);
+  assert.equal(missing.code, 3);
   assert.equal(JSON.parse(missing.err).error, 'unknown-group');
   assert.equal(run('group').code, 2);
   assert.equal(readFileSync(join(addons, 'acme', 'security', 'security.xml'), 'utf8'), before, 'read-only');
@@ -212,7 +212,7 @@ test('access commands: search, group, acl and gate traces (read-only, json and b
 // ---- Builder (the only writing commands): dry-run by default, --apply writes, never overwrites.
 
 function runIn(root, ...args) {
-  const r = spawnSync(process.execPath, [CLI, '--addons', root, '--base', base, '--odoo-version', '15', ...args], { encoding: 'utf8' });
+  const r = spawnSync(process.execPath, [CLI, '--addons', root, '--base', base, '--odoo-version', '15', ...args], { encoding: 'utf8', env: { ...process.env, ODOO_DC_CACHE: '0' } });
   return { code: r.status, out: r.stdout, err: r.stderr, json: () => JSON.parse(r.stdout) };
 }
 
@@ -250,6 +250,14 @@ test('builder: module new / model new / view new / access add, dry-run then --ap
     const view = runIn(root, 'view', 'new', 'library', 'library.book', '--type', 'form');
     assert.equal(view.code, 1, 'form view id already exists');
     assert.match(JSON.parse(view.err).message, /duplicate-xml-id: xml id library\.library_book_view_form/);
+
+    const ext = runIn(root, 'view', 'new', 'library', '--inherit', 'library.library_book_view_form', '--expr', '//form', '--fields', 'name', '--apply');
+    assert.equal(ext.code, 0, ext.err);
+    const extText = readFileSync(join(root, 'library', 'views', 'library_library_book_view_form_inherit.xml'), 'utf8');
+    assert.match(extText, /inherit_id" ref="library\.library_book_view_form"/);
+    assert.match(extText, /<xpath expr="\/\/form" position="inside">/);
+    assert.match(extText, /<field name="name"\/>/);
+    assert.match(readFileSync(join(root, 'library', '__manifest__.py'), 'utf8'), /views\/library_library_book_view_form_inherit\.xml/);
 
     const acl = runIn(root, 'access', 'add', 'library', 'library.book', '-', 'r---', '--apply');
     assert.equal(acl.code, 0, acl.err);

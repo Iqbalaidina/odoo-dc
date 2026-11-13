@@ -24,6 +24,8 @@ export const BUILDER_USAGE = `Builder (writes only with --apply; default is a dr
         [--access base.group_user:rwcd]... [--no-access] [--no-action] [--create-module --into <dir> --depends ...]
   view new <module> <model> --type form|list|search [--type ...] [--fields a,b,c]
         (fields limited to the module's depends; required when more than 20 are reachable)
+  view new <module> --inherit <xmlId> [--expr <xpath>] [--position inside|after|before|replace]
+        [--id <record id>] [--fields a,b]   (extension view; model and type come from the index)
   access add <module> <model> <group|-> <rwcd>
   build --spec spec.json [--into <dir>]
     common: --apply  --odoo-version n  --into <addons dir> (default: where <module> is found)  --no-backup
@@ -41,7 +43,7 @@ export const BUILDER_BOOL_FLAGS = ['apply', 'application', 'no-action', 'no-acce
 export function isBuilderCommand(cmd, args) {
   if (cmd === 'build') return true;
   if ((cmd === 'module' || cmd === 'model') && args[0] === 'new') return true;
-  if (cmd === 'view' && args[0] === 'new' && args.length >= 3) return true;
+  if (cmd === 'view' && args[0] === 'new' && args.length >= 2) return true;
   return cmd === 'access' && args[0] === 'add';
 }
 
@@ -102,8 +104,23 @@ async function specFrom(cmd, args, one, all, has) {
     return { module: args[1], ...(has('create-module') ? { createModule: moduleOpts() } : {}), models: [model] };
   }
   if (cmd === 'view') {
+    const inherit = one('inherit');
+    if (inherit !== undefined) {
+      if (inherit.length === 0) throw usageError('--inherit needs a view xml id');
+      return {
+        module: args[1],
+        views: [{
+          inherit,
+          model: '',
+          expr: one('expr'),
+          position: one('position'),
+          id: one('id'),
+          fields: list('fields'),
+        }],
+      };
+    }
     const types = list('type');
-    if (types.length === 0) throw usageError('view new needs --type form|list|search');
+    if (types.length === 0) throw usageError('view new needs --type form|list|search, or --inherit <xmlId>');
     const fields = list('fields');
     return { module: args[1], views: types.map((type) => ({ model: args[2], type, ...(fields.length > 0 ? { fields } : {}) })) };
   }
@@ -179,6 +196,23 @@ export async function runBuilder(env) {
     addonsDir = found[0];
   }
   const root = assertWritableTarget(addonsDir, allRoots);
+  for (const view of spec.views ?? []) {
+    if (typeof view?.inherit !== 'string' || view.inherit.length === 0) continue;
+    let payload;
+    try {
+      payload = await get(`action=related&xmlId=${encodeURIComponent(view.inherit)}&root=${encodeURIComponent(root.id)}`);
+    } catch (error) {
+      if (error.code === 'unknown-view') {
+        throw Object.assign(new Error(`inherit target ${view.inherit} is not in the view index`), { exitCode: 3, code: 'unknown-view' });
+      }
+      throw error;
+    }
+    if (payload.target === null || payload.target === undefined) {
+      throw Object.assign(new Error(`inherit target ${view.inherit} is not in the view index`), { exitCode: 3, code: 'unknown-view' });
+    }
+    view.model = payload.target.model;
+    view.targetType = payload.target.type;
+  }
   const warnings = [];
   const collection = relative(root.path, addonsDir).split(/[/\\]/)[0];
   const folder = (root.subfolders ?? []).find((entry) => entry.name === collection);
