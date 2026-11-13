@@ -11,6 +11,7 @@
  * (2 for usage errors). Nothing is swallowed: partial results carry explicit
  * `warnings` / `truncated` / `errors` fields instead.
  */
+import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
@@ -36,6 +37,14 @@ Lookup commands (read-only, JSON on stdout unless --format brief):
   pysearch <query> [--type method|function|model]
   pymodel <model>                fields + methods of a model
   pymethod <model> <name> [--step n]   override chain, super() targets, source
+  callers <model> <method>       call sites of a method: python bodies, view buttons/<function>,
+                                 server actions [--limit n]. One positional = method only, no
+                                 model filter.
+  dupes [--modules a,b] [--model m] [--threshold 0.75] [--min-lines 8] [--min-tokens 12] [--limit 40]
+                                 near-duplicate method bodies (token shingles); --modules takes
+                                 globs ("imt_*")
+  similar <model.method> [--threshold 0.5] [--limit 10]
+                                 methods closest to one method (also "<model> <method>")
   access [query] [--type group|model|artifact]
                                  search groups, models and gated views/menus/actions (ACL index)
   group <xmlId>                  group trace: includes / included by, per-model R/W/C/D, record rules,
@@ -53,8 +62,10 @@ Lookup commands (read-only, JSON on stdout unless --format brief):
                                  action plus q/query (search, pysearch, actions, access),
                                  xmlId (view, compose, related, impact, action, group, gate,
                                  inheritors), model + field (field), model (pymodel, acl),
-                                 model + name (pymethod), query (get). Per-item options: root,
-                                 limit, type, scope, step, maxMethods, maxFiles, all, full,
+                                 model + name (pymethod, callers, similar), modules
+                                 (dupes), query (get). Per-item options: root, limit, type,
+                                 scope, step, maxMethods, maxFiles, threshold, minLines,
+                                 minTokens, modules, module, installedOnly, all, full,
                                  refresh, format ("brief"), fields ("a,b" projection), meta
                                  (false drops the global stats/errors from that line).
                                  --schema prints this contract as JSON and writes nothing.
@@ -75,6 +86,15 @@ Roots default to discovery under --base (default $ODOO_DC_BASE, else the current
 per-item meta:false), so output only carries the answer.
 --out file writes to a file. compose/impact merge at most 400 views per query; the payload sets
 capped=true and impact warns when the cap (or the 200-child related list) truncates.
+Install state: --db <name> reads installed modules through psql
+(ir_module_module.state='installed'); --installed <file> reads a one-module-per-line list
+(offline); --installed-only drops rows whose module is known-uninstalled. Env fallbacks:
+ODOO_DC_DB, ODOO_DC_INSTALLED, ODOO_DC_PSQL (psql binary, default "psql"). A psql failure is a
+warning in the result's "installed" block, never exit 1; doctor reports the same block.
+Module filter: --module <glob[,glob]> keeps only rows whose defining module matches ("*"
+wildcard): pymodel, field, pysearch. --modules is the same filter for dupes. --limit bounds
+every brief list (default 80) and prints "… N more (raise --limit or narrow with --module)"
+when it cuts a list.
 
 ${BUILDER_USAGE}`;
 
@@ -82,6 +102,14 @@ ${BUILDER_USAGE}`;
 const READ_ACTIONS = new Set([
   'roots', 'index', 'file', 'module', 'report', 'pyindex', 'pymethod', 'pymodel', 'fields',
   'search', 'compose', 'related', 'inheritors', 'flows', 'modelflows', 'actions', 'action', 'xpath', 'xpathbase', 'secindex', 'sectrace',
+  'callers', 'dupes', 'similar',
+]);
+
+/** Commands of the `runCommand` switch. Checked before any engine work so a typo is exit 2. */
+const COMMANDS = new Set([
+  'roots', 'doctor', 'search', 'view', 'compose', 'related', 'impact', 'actions', 'action',
+  'field', 'pysearch', 'pymodel', 'pymethod', 'callers', 'dupes', 'similar', 'access', 'group',
+  'acl', 'gate', 'get',
 ]);
 
 /** Contract of one `batch` item; printed by `batch --schema` and enforced before execution. */
@@ -89,14 +117,14 @@ const BATCH_SCHEMA = {
   usage: 'odoo-dc batch [--file cmds.json] [--format brief] [--fields a,b] [--no-meta] [--schema]',
   readOnly: true,
   itemKeys: {
-    action: 'required: one read command (search, view, compose, related, impact, action, actions, field, pymodel, pymethod, pysearch, access, group, acl, gate, get, roots, doctor)',
+    action: 'required: one read command (search, view, compose, related, impact, action, actions, field, pymodel, pymethod, pysearch, callers, dupes, similar, access, group, acl, gate, get, roots, doctor)',
     id: 'optional line id (defaults to the item index)',
     q: 'search, pysearch, actions, access: query string (query is an alias)',
     query: 'get: raw query string; alias of q for search-like commands',
     xmlId: 'view, compose, related, impact, action, group, gate, inheritors',
-    model: 'field: model name; pymodel, acl: model name; pymethod: model name',
+    model: 'field: model name; pymodel, acl, callers, similar: model name; pymethod: model name',
     field: 'field: field name',
-    name: 'pymethod: method name',
+    name: 'pymethod, callers, similar: method name (callers/similar accept "model.method" too)',
     root: 'per-item root filter (label, path or id)',
     limit: 'per-item row limit',
     type: 'per-item type filter (search, pysearch, access)',
@@ -104,6 +132,12 @@ const BATCH_SCHEMA = {
     step: 'pymethod: override-chain step',
     maxMethods: 'field: max analysed methods (max-methods is an alias)',
     maxFiles: 'field: max view files (max-files is an alias)',
+    modules: 'dupes: comma list of module globs (imt_*); module is the alias',
+    module: 'pymodel, field, pysearch: module glob filter (alias of modules here)',
+    threshold: 'dupes, similar: similarity threshold (0.2…1)',
+    minLines: 'dupes: minimum body line count (min-lines is an alias)',
+    minTokens: 'dupes: minimum body token count (min-tokens is an alias)',
+    installedOnly: 'boolean: drop rows whose module is known-uninstalled',
     all: 'boolean: compose every inheritor',
     full: 'boolean: keep wireframe data',
     refresh: 'boolean: force a reindex',
@@ -138,7 +172,7 @@ const permText = (p) => (p ? `${p.read ? 'R' : '-'}${p.write ? 'W' : '-'}${p.cre
 function parseArgs(argv) {
   const pos = [];
   const flags = new Map();
-  const bool = new Set(['refresh', 'all', 'full', 'help', 'no-cache', 'include-data', 'prune', 'schema', 'no-meta', ...BUILDER_BOOL_FLAGS]);
+  const bool = new Set(['refresh', 'all', 'full', 'help', 'no-cache', 'include-data', 'prune', 'schema', 'no-meta', 'installed-only', ...BUILDER_BOOL_FLAGS]);
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg.startsWith('--')) {
@@ -154,6 +188,286 @@ function parseArgs(argv) {
 /** @param {string} message @returns {Error} usage error (exit 2). */
 function usage(message) {
   return Object.assign(new Error(message), { exitCode: 2, code: 'usage' });
+}
+
+/** Default row budget of one brief list; `--limit` overrides it (G6). */
+const BRIEF_LIMIT = 80;
+
+/** Marker that an engine facade already injects `onlyInstalled=1`. */
+const ONLY_INSTALLED = Symbol('onlyInstalled');
+
+/**
+ * Last value of one flag.
+ * @param {Map<string, string[]>} flags - parsed flags.
+ * @param {string} key - flag name without the leading dashes.
+ * @returns {string|undefined} last value, or undefined.
+ */
+function lastFlag(flags, key) {
+  return flags.get(key)?.at(-1);
+}
+
+/**
+ * Compile a comma list of module globs (`imt_*`) to anchored case-insensitive regexps.
+ * @param {string|undefined} value - raw flag value.
+ * @returns {RegExp[]} one expression per non-empty glob.
+ */
+function moduleGlobs(value) {
+  if (typeof value !== 'string') return [];
+  return value.split(',')
+    .map((glob) => glob.trim())
+    .filter((glob) => glob.length > 0)
+    .map((glob) => new RegExp(`^${glob.split('*').map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`, 'i'));
+}
+
+/**
+ * @param {RegExp[]} globs - from moduleGlobs.
+ * @param {string} module - module name to test.
+ * @returns {boolean} true when there is no filter or one glob matches.
+ */
+function moduleMatches(globs, module) {
+  if (globs.length === 0) return true;
+  return globs.some((re) => re.test(String(module ?? '')));
+}
+
+/**
+ * G6: never print a bare "…"; say how many rows are hidden and how to widen the list.
+ * @param {number} hidden - rows the list cut.
+ * @param {string} widen - the flag-level advice.
+ * @returns {string} one hint line body.
+ */
+function hiddenHint(hidden, widen = 'raise --limit') {
+  return `… ${hidden} more (${widen})`;
+}
+
+/**
+ * G2 brief line: `--installed-only` is silent when it drops nothing, loud when it does.
+ * @param {number|undefined} filtered - rows the engine dropped.
+ * @returns {string|null} one line body, or null when nothing was dropped.
+ */
+function installedFilterLine(filtered) {
+  return Number.isFinite(filtered) && filtered > 0 ? `${filtered} row(s) dropped by --installed-only` : null;
+}
+
+/**
+ * One truncation line for a payload that carries `total` next to a shown list.
+ * @param {number|undefined} total - unfiltered row count.
+ * @param {number} shown - rows already printed.
+ * @param {string} widen - flag-level advice.
+ * @returns {string} hint line body.
+ */
+function truncationLine(total, shown, widen) {
+  return total !== undefined && total > shown ? hiddenHint(total - shown, widen) : `… list truncated (${widen})`;
+}
+
+/** @param {Map<string, string[]>} [flags] @returns {number} brief row budget for each list. */
+function briefLimit(flags = new Map()) {
+  const value = Number.parseInt(lastFlag(flags, 'limit') ?? '', 10);
+  return Number.isFinite(value) && value > 0 ? value : BRIEF_LIMIT;
+}
+
+/**
+ * People-facing summary of a field's kwargs (`string="X" ondelete="restrict"`).
+ * @param {object|undefined} attrs - field attributes.
+ * @returns {string} bounded `key=value` list, or `-`.
+ */
+function attrSummary(attrs) {
+  const entries = Object.entries(attrs ?? {})
+    .filter(([, value]) => value !== null && value !== undefined && value !== '');
+  if (entries.length === 0) return '-';
+  const shown = entries.slice(0, 8).map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);
+  return `${shown.join(' ')}${entries.length > shown.length ? ` (+${entries.length - shown.length})` : ''}`;
+}
+
+/**
+ * `<model.method>` or `<model> <method>` positional pair (the engine wants both).
+ * @param {string[]} args - positional arguments.
+ * @returns {[string, string]} model and method name.
+ */
+function splitModelMethod(args) {
+  if (args.length >= 2) return [args[0], args[1]];
+  const at = String(args[0] ?? '').lastIndexOf('.');
+  if (at <= 0 || at === String(args[0]).length - 1) throw usage('similar needs <model.method> or <model> <method>');
+  return [String(args[0]).slice(0, at), String(args[0]).slice(at + 1)];
+}
+
+/**
+ * `--threshold` query fragment: a typo must fail fast instead of silently taking a default.
+ * @param {string|undefined} value - raw flag value.
+ * @returns {string} query fragment, empty when the flag is absent.
+ */
+function thresholdParam(value) {
+  if (value === undefined || value === '') return '';
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0.2 || number > 1) throw usage('--threshold must be a number between 0.2 and 1');
+  return `&threshold=${enc(String(number))}`;
+}
+
+/**
+ * Filter rows by defining module: pymodel/field/pysearch `--module`.
+ * @param {Array<object>} rows - rows that name a `module`.
+ * @param {RegExp[]} globs - compiled filter.
+ * @param {(row: object) => string[]} modulesOf - modules a row is attributed to.
+ * @returns {Array<object>} kept rows.
+ */
+function filterByModule(rows, globs, modulesOf) {
+  if (globs.length === 0) return rows;
+  return rows.filter((row) => modulesOf(row).some((module) => moduleMatches(globs, module)));
+}
+
+/** Modules that define a pymodel field; the effective module comes first when known. */
+function fieldModules(field) {
+  const definers = [...new Set((field.definers ?? []).map((definer) => definer.module).filter(Boolean))];
+  const declared = Array.isArray(field.modules) && field.modules.length > 0 ? field.modules : [];
+  const modules = [...new Set([field.module, ...definers, ...declared].filter(Boolean))];
+  return modules.length > 0 ? modules : ['?'];
+}
+
+/** Modules that define a pymodel method (every definition contributes). */
+function methodModules(method) {
+  const defined = [...new Set((method.definitions ?? []).map((definition) => definition.module).filter(Boolean))];
+  const modules = [...new Set([method.module, ...defined].filter(Boolean))];
+  return modules.length > 0 ? modules : ['?'];
+}
+
+/** True when a field row is defined (effectively or by an override) in a matching module. */
+function fieldInModules(field, globs) {
+  return moduleMatches(globs, field.module) || (field.definers ?? []).some((definer) => moduleMatches(globs, definer.module));
+}
+
+/**
+ * Apply `--module` to a pymodel payload. `fieldCount` stays the unfiltered total;
+ * `moduleFilter` carries the globs and the kept counts.
+ * @param {object} payload - pymodel result.
+ * @param {string|undefined} value - raw --module value.
+ * @returns {object} filtered payload (unchanged without a filter).
+ */
+function filterPymodel(payload, value) {
+  const globs = moduleGlobs(value);
+  if (globs.length === 0) return payload;
+  const fields = (payload.fields ?? []).filter((field) => fieldInModules(field, globs));
+  const methods = (payload.methods ?? []).filter((method) => methodModules(method).some((module) => moduleMatches(globs, module)));
+  return {
+    ...payload,
+    fields,
+    methods,
+    moduleFilter: {
+      globs: value.split(',').map((glob) => glob.trim()).filter(Boolean),
+      fields: fields.length,
+      methods: methods.length,
+      fieldTotal: (payload.fields ?? []).length,
+      methodTotal: (payload.methods ?? []).length,
+    },
+  };
+}
+
+/**
+ * Engine facade that adds G2's `onlyInstalled=1` to every read, so no command has
+ * to remember it. Idempotent; `state` is forwarded for `doctor`.
+ * @param {object} engine - engine facade.
+ * @returns {object} facade with the same `state` and a filtered `read`.
+ */
+function withOnlyInstalled(engine) {
+  if (engine[ONLY_INSTALLED] === true) return engine;
+  const facade = {
+    state: engine.state,
+    read: (action, params) => {
+      params.set('onlyInstalled', '1');
+      return engine.read(action, params);
+    },
+  };
+  Object.defineProperty(facade, ONLY_INSTALLED, { value: true });
+  return facade;
+}
+
+/**
+ * Split a one-module-per-line file (`#` comments and blank lines ignored, duplicates dropped).
+ * @param {string} text - file contents.
+ * @returns {string[]} module names.
+ */
+function parseModuleLines(text) {
+  const names = text.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'));
+  return [...new Set(names)];
+}
+
+/**
+ * The spec's psql query for installed modules; throws with psql's own message.
+ * @param {string} db - database name.
+ * @param {string} binary - psql executable.
+ * @returns {string[]} installed module names, ordered by name.
+ */
+function psqlInstalledModules(db, binary) {
+  const fromPsql = execFileSync(binary, ['-X', '-q', '-t', '-A', '-d', db, '-c', "select name from ir_module_module where state='installed' order by name"], {
+    encoding: 'utf8',
+    timeout: 15_000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return parseModuleLines(fromPsql);
+}
+
+/**
+ * Resolve G2 install state: `--db`/ODOO_DC_DB runs psql, `--installed`/ODOO_DC_INSTALLED
+ * reads a file (`--db` wins when both are given: the live database is the authority).
+ * A failure is a warning, never an error: `block.error` says why and the engine sees
+ * `installedModules: null` (unknown state).
+ * @param {Map<string, string[]>} flags - parsed flags.
+ * @returns {{ modules: string[]|null, block: object|null, warning: string|null }} resolution.
+ */
+function resolveInstalled(flags) {
+  const db = lastFlag(flags, 'db') ?? process.env.ODOO_DC_DB;
+  const file = lastFlag(flags, 'installed') ?? process.env.ODOO_DC_INSTALLED;
+  const hasDb = db !== undefined && db !== '';
+  const hasFile = file !== undefined && file !== '';
+  if (!hasDb && !hasFile) return { modules: null, block: null, warning: null };
+  const source = hasDb ? 'db' : 'file';
+  const block = { source, db: null, file: null, count: 0, error: null };
+  try {
+    let modules;
+    if (hasDb) {
+      block.db = db;
+      try {
+        modules = psqlInstalledModules(db, process.env.ODOO_DC_PSQL ?? 'psql');
+      } catch (error) {
+        const detail = String(error.stderr || error.message || error).trim().split(/\r?\n/).filter(Boolean).at(-1) ?? 'psql failed';
+        throw new Error(`psql -d ${db} failed: ${detail.slice(0, 240)}`);
+      }
+    } else {
+      block.file = resolve(file);
+      try {
+        modules = parseModuleLines(readFileSync(block.file, 'utf8'));
+      } catch (error) {
+        throw new Error(`cannot read installed-module file ${block.file}: ${error.message}`);
+      }
+    }
+    block.count = modules.length;
+    return { modules, block, warning: null };
+  } catch (error) {
+    block.error = error.message;
+    return { modules: null, block, warning: `install state unavailable: ${error.message}` };
+  }
+}
+
+/** Shape one warning like the payload's own entries (strings, or `{ code, message }` objects). */
+function warningEntry(existing, text) {
+  const sample = Array.isArray(existing) ? existing[0] : undefined;
+  return sample !== null && typeof sample === 'object' && 'message' in sample ? { code: 'installed-state', message: text } : text;
+}
+
+/**
+ * Attach G2's resolution to a command result. Additive only: `installed` and a
+ * warning are added, existing keys are never renamed or dropped. Commands that
+ * report the block themselves (doctor) are left alone.
+ * @param {object} result - command payload.
+ * @param {{ block: object|null, warning: string|null }|null} installed - resolution.
+ * @returns {object} the payload with `installed`.
+ */
+function withInstalled(result, installed) {
+  if (installed === null || installed === undefined || installed.block === null) return result;
+  if (result === null || typeof result !== 'object' || Array.isArray(result) || 'installed' in result) return result;
+  const warnings = [...(Array.isArray(result.warnings) ? result.warnings : [])];
+  if (installed.warning !== null) warnings.push(warningEntry(warnings, installed.warning));
+  return { ...result, installed: installed.block, warnings };
 }
 
 /** Run one read-only action against the engine; `query` is a URL query string. */
@@ -338,16 +652,23 @@ async function fieldReport(engine, roots, model, field, flags) {
     }
   }
 
-  const methods = (flowReport.methods ?? []).map((row) => ({ name: row.name, roles: row.roles, module: row.module, file: `${row.file}:${row.line}` }));
-  const externalWriters = (flowReport.externalWriters ?? []).map((row) => ({
-    model: row.model, method: row.name, roles: row.roles, module: row.module, file: `${row.file}:${row.line}`,
+  const methods = (flowReport.methods ?? []).map((row) => ({
+    name: row.name, roles: row.roles, module: row.module, file: `${row.file}:${row.line}`, installed: row.installed ?? null,
   }));
+  const externalWriters = (flowReport.externalWriters ?? []).map((row) => ({
+    model: row.model, method: row.name, roles: row.roles, module: row.module, file: `${row.file}:${row.line}`, installed: row.installed ?? null,
+  }));
+  // --module keeps the definers/methods whose module matches; views carry no module,
+  // so they stay (the xml id prefix is not a reliable module name).
+  const globs = moduleGlobs(lastFlag(flags, 'module'));
+  const definers = (flowReport.definition.definers ?? []).filter((definer) => moduleMatches(globs, definer.module));
+  const keptMethods = filterByModule(methods, globs, (row) => [row.module]);
 
   const warnings = [];
   if (externalWriters.length > 0) {
     warnings.push(`writes also come from ${[...new Set(externalWriters.map((row) => row.model))].join(', ')} (relation fields pointing at ${model}); see externalWriters`);
   }
-  if (methods.every((row) => !(row.roles ?? []).includes('write')) && externalWriters.length === 0) {
+  if (keptMethods.every((row) => !(row.roles ?? []).includes('write')) && externalWriters.length === 0) {
     warnings.push('no writer found among the model methods or through a relation field; env()/search() writes are not scanned');
   }
   if (viewsTruncated) warnings.push(`view search truncated (max ${maxFiles} files); raise --max-files`);
@@ -364,27 +685,108 @@ async function fieldReport(engine, roots, model, field, flags) {
       module: flowReport.definition.module,
       file: `${flowReport.definition.file}:${flowReport.definition.line}`,
       definitions: flowReport.definition.definitions,
+      inverse: flowReport.definition.inverse ?? '',
+      definers,
     },
+    // G4: the engine reports the relational check next to `definition`, not inside it.
+    relation: flowReport.relation ?? flowReport.definition.relation ?? null,
+    filtered: flowReport.filtered ?? 0,
     computeMethod: flowReport.computeMethod ?? null,
     views,
-    methods,
+    methods: keptMethods,
     externalWriters,
+    ...(globs.length > 0 ? { moduleFilter: { globs: String(lastFlag(flags, 'module')).split(',').map((glob) => glob.trim()).filter(Boolean), definers: definers.length, definerTotal: (flowReport.definition.definers ?? []).length, methods: keptMethods.length } } : {}),
     errors: viewErrors,
     warnings,
   };
 }
 
+/**
+ * Group rows by module name, in module-name order. One row can land in several
+ * groups (a field with several definers, a method with several definitions).
+ * @param {Array<object>} rows - rows to group.
+ * @param {(row: object) => string[]} modulesOf - modules one row belongs to.
+ * @returns {Map<string, Array<object>>} groups.
+ */
+function groupByModules(rows, modulesOf) {
+  const groups = new Map();
+  for (const row of rows) {
+    for (const module of modulesOf(row)) groups.set(module, [...(groups.get(module) ?? []), row]);
+  }
+  return new Map([...groups.entries()].sort(([left], [right]) => left.localeCompare(right)));
+}
+
+/**
+ * Print `module (n): a, b, …` lines for a grouped list, bounded by `limit` rows (G6).
+ * @param {string[]} lines - output buffer.
+ * @param {Map<string, Array<object>>} groups - from groupByModules.
+ * @param {number} limit - rows to print.
+ * @param {(row: object) => string} labelOf - row label.
+ * @returns {number} hidden row count.
+ */
+function groupedLines(lines, groups, limit, labelOf, noteOf = null) {
+  if (groups.size === 0) {
+    lines.push('  (none)');
+    return 0;
+  }
+  let shown = 0;
+  let hidden = 0;
+  for (const [module, rows] of groups) {
+    if (shown >= limit) {
+      hidden += rows.length;
+      continue;
+    }
+    const visible = rows.slice(0, limit - shown);
+    lines.push(`  ${module} (${rows.length}): ${visible.map(labelOf).join(', ')}${noteOf === null ? '' : noteOf(module, rows)}`);
+    shown += visible.length;
+    hidden += rows.length - visible.length;
+  }
+  return hidden;
+}
+
+/**
+ * G2 group-header marker: say when every row in one module group belongs to a
+ * module the database reports as uninstalled, so a grouped brief cannot make a
+ * disabled module look live.
+ * @param {string} module - group module.
+ * @param {Array<object>} rows - rows of that group.
+ * @returns {string} `'  uninstalled'` or ''.
+ */
+function installedNote(module, rows) {
+  const states = rows.flatMap((row) => [
+    row.installed,
+    ...(Array.isArray(row.definers) ? row.definers : []).filter((definer) => definer.module === module).map((definer) => definer.installed),
+    // A field row's `definitions` is a count; only a method row carries the list.
+    ...(Array.isArray(row.definitions) ? row.definitions : []).filter((definition) => definition.module === module).map((definition) => definition.installed),
+  ]).filter((state) => state === true || state === false);
+  return states.length > 0 && states.every((state) => state === false) ? '  uninstalled' : '';
+}
+
+/** Brief markers of one definer row: `effective` and install state (G1/G2). */
+function definerMarkers(definer) {
+  const marks = [];
+  if (definer.effective === true) marks.push('effective');
+  if (definer.installed === true) marks.push('installed');
+  else if (definer.installed === false) marks.push('uninstalled');
+  return marks.join(' ');
+}
+
 /** Compact text for `--format brief`; `null` means the command has no brief form. */
-function toBrief(cmd, r) {
+function toBrief(cmd, r, flags = new Map()) {
   const lines = [];
+  const limit = briefLimit(flags);
   if (cmd === 'search') {
     for (const v of r.items ?? []) lines.push([v.xmlId, v.model, `${v.type}${v.mode === 'extension' ? ' (ext)' : ''}`, `${v.file}:${v.line}`].join('\t'));
-    if (r.truncated) lines.push('… truncated');
+    if (r.truncated) lines.push(truncationLine(r.total, (r.items ?? []).length, 'raise --limit'));
+    for (const w of r.warnings ?? []) lines.push(`WARNING ${w}`);
   } else if (cmd === 'actions') {
     for (const a of r.items ?? []) lines.push([a.xmlId, a.resModel, a.viewMode, a.target, a.file].join('\t'));
-    if (r.truncated) lines.push(`… ${r.total} total`);
+    if (r.truncated) lines.push(truncationLine(r.total, (r.items ?? []).length, 'raise --limit'));
+    for (const w of r.warnings ?? []) lines.push(`WARNING ${w}`);
   } else if (cmd === 'pysearch') {
     for (const m of r.items ?? []) lines.push([m.kind, m.model ? `${m.model}.${m.name}` : m.name, m.module, `${m.file ?? ''}${m.line ? `:${m.line}` : ''}`].join('\t'));
+    if (r.truncated) lines.push(truncationLine(r.total, (r.items ?? []).length, 'raise --limit or narrow with --module'));
+    for (const w of r.warnings ?? []) lines.push(`WARNING ${w}`);
   } else if (cmd === 'impact') {
     lines.push(`${r.xmlId}  [${r.type}] ${r.model}  ${r.file}  (root: ${r.root})`);
     lines.push(`parent: ${r.parent ?? '-'}`);
@@ -394,30 +796,138 @@ function toBrief(cmd, r) {
     for (const s of r.skipped) lines.push(`SKIPPED ${s.xmlId} ${s.reason} ${s.expr}`);
     for (const w of r.warnings) lines.push(`WARNING ${w}`);
   } else if (cmd === 'field') {
-    lines.push(`${r.model}.${r.field}  ${r.definition.fieldType}${r.definition.comodel ? `(${r.definition.comodel})` : ''}  ${r.definition.file}${r.computeMethod ? `  compute=${r.computeMethod}` : ''}`);
-    lines.push(`views (${r.views.length}):`);
-    for (const v of r.views) lines.push(`  ${v.xmlId}\t${v.type}${v.mode === 'extension' ? ' (ext)' : ''}\t${v.file}`);
-    lines.push(`methods (${r.methods.length}):`);
-    for (const m of r.methods) lines.push(`  ${m.name}\t${m.roles.join('+')}\t${m.file ?? ''}`);
+    const def = r.definition ?? {};
+    lines.push(`${r.model}.${r.field}  ${def.fieldType ?? '?'}${def.comodel ? `(${def.comodel})` : ''}  ${def.file ?? ''}${r.computeMethod ? `  compute=${r.computeMethod}` : ''}`);
+    const definers = def.definers ?? [];
+    if (definers.length === 0) {
+      if (r.moduleFilter !== undefined) lines.push(`definers: 0 of ${r.moduleFilter.definerTotal ?? 1} match the module filter`);
+      else lines.push(`definers: 1\t${def.module ?? '?'}\t${def.file ?? ''}\teffective`);
+    } else {
+      lines.push(`definers (${definers.length}):`);
+      for (const definer of definers.slice(0, limit)) {
+        const type = definer.fieldType ?? def.fieldType ?? '';
+        lines.push(`  ${definer.module}\t${definer.file}:${definer.line}\t${type}${definer.comodel ? `(${definer.comodel})` : ''}\t${attrSummary(definer.attrs)}\t${definerMarkers(definer)}`.trimEnd());
+      }
+      if (definers.length > limit) lines.push(`  ${hiddenHint(definers.length - limit, 'raise --limit')}`);
+    }
+    if (r.moduleFilter !== undefined) lines.push(`module filter: ${r.moduleFilter.globs.join(',')}`);
+    const relation = r.relation ?? def.relation ?? null;
+    const issues = relation?.issues ?? [];
+    if (issues.length > 0) {
+      lines.push(`relation: ${issues.length} issue(s)`);
+      // Same text the payload warning carries, so the brief reads like `WARNING <code>: …`.
+      for (const issue of issues) lines.push(`WARNING ${issue.code}: ${issue.message ?? ''}`.trimEnd());
+    } else if (relation !== null) lines.push('relation: ok');
+    const filteredLine = installedFilterLine(r.filtered);
+    if (filteredLine !== null) lines.push(filteredLine);
+    const views = r.views ?? [];
+    lines.push(`views (${views.length}):`);
+    for (const v of views.slice(0, limit)) lines.push(`  ${v.xmlId}\t${v.type}${v.mode === 'extension' ? ' (ext)' : ''}\t${v.file}`);
+    if (views.length > limit) lines.push(`  ${hiddenHint(views.length - limit, 'raise --limit or narrow with --module')}`);
+    const methods = r.methods ?? [];
+    lines.push(`methods (${methods.length}):`);
+    for (const m of methods.slice(0, limit)) lines.push(`  ${m.name}\t${(m.roles ?? []).join('+')}\t${m.file ?? ''}${m.installed === false ? '\tuninstalled' : ''}`);
+    if (methods.length > limit) lines.push(`  ${hiddenHint(methods.length - limit, 'raise --limit or narrow with --module')}`);
     if ((r.externalWriters ?? []).length > 0) {
       lines.push(`external writers (${r.externalWriters.length}):`);
-      for (const m of r.externalWriters) lines.push(`  ${m.model}.${m.method}\t${m.roles.join('+')}\t${m.file ?? ''}`);
+      for (const m of r.externalWriters.slice(0, limit)) lines.push(`  ${m.model}.${m.method}\t${(m.roles ?? []).join('+')}\t${m.file ?? ''}${m.installed === false ? '\tuninstalled' : ''}`);
     }
-    for (const e of r.errors) lines.push(`ERROR ${e.file ?? e.method}: ${e.error}`);
-    for (const w of r.warnings) lines.push(`WARNING ${w}`);
+    // Relation issues already reach `warnings`; print each issue once, not twice.
+    const issuePrefixes = issues.map((issue) => `${issue.code}: `);
+    for (const e of r.errors ?? []) lines.push(`ERROR ${e.file ?? e.method}: ${e.error}`);
+    for (const w of r.warnings ?? []) if (!issuePrefixes.some((prefix) => String(w).startsWith(prefix))) lines.push(`WARNING ${w}`);
   } else if (cmd === 'view') {
     const v = r.view ?? {};
     lines.push(`${v.xmlId}  [${v.type ?? '?'}${v.mode === 'extension' ? ' ext' : ''}] ${v.model || '(no model)'}  ${r.file?.file ?? ''}:${v.line ?? ''}  (${r.root ?? ''})`);
     lines.push(`inherit: ${v.inheritId || '-'}  priority: ${v.priority || '-'}  fields: ${(v.fields ?? []).length}  xpaths: ${(v.xpaths ?? []).length}`);
-    if ((v.fields ?? []).length > 0) lines.push(`fields: ${(v.fields ?? []).slice(0, 80).join(', ')}`);
+    const viewFields = v.fields ?? [];
+    if (viewFields.length > 0) {
+      lines.push(`fields: ${viewFields.slice(0, limit).join(', ')}`);
+      if (viewFields.length > limit) lines.push(`  ${hiddenHint(viewFields.length - limit, 'raise --limit')}`);
+    }
     const acts = r.actions ?? [];
-    lines.push(`actions (${acts.length}): ${acts.slice(0, 10).map((a) => a.xmlId).join(', ') || '-'}${acts.length > 10 ? ', …' : ''}`);
+    lines.push(`actions (${acts.length}): ${acts.slice(0, limit).map((a) => a.xmlId).join(', ') || '-'}`);
+    if (acts.length > limit) lines.push(`  ${hiddenHint(acts.length - limit, 'raise --limit')}`);
+    for (const w of r.warnings ?? []) lines.push(`WARNING ${w}`);
   } else if (cmd === 'pymodel') {
-    const fields = (r.fields ?? []).map((f) => f.name ?? f);
-    const methods = (r.methods ?? []).map((m) => m.name ?? m);
-    lines.push(`${r.model}  ${r.fieldCount ?? fields.length} fields  ${methods.length} methods${r.description ? `  ${r.description}` : ''}`);
-    if (fields.length > 0) lines.push(`fields: ${fields.slice(0, 80).join(', ')}${fields.length > 80 ? ', …' : ''}`);
-    if (methods.length > 0) lines.push(`methods: ${methods.slice(0, 80).join(', ')}${methods.length > 80 ? ', …' : ''}`);
+    const fields = r.fields ?? [];
+    const methods = r.methods ?? [];
+    const filter = r.moduleFilter;
+    const fieldTotal = filter?.fieldTotal ?? r.fieldCount ?? fields.length;
+    const methodTotal = filter?.methodTotal ?? methods.length;
+    lines.push(`${r.model}  ${filter ? `${fields.length} of ${fieldTotal}` : fieldTotal} fields  ${filter ? `${methods.length} of ${methodTotal}` : methodTotal} methods${r.description ? `  ${r.description}` : ''}${filter ? `  module ${filter.globs.join(',')}` : ''}`);
+    lines.push('fields by module:');
+    const fieldGroups = groupByModules(fields, (field) => [fieldModules(field)[0]]);
+    const hiddenFields = groupedLines(lines, fieldGroups, limit, (field) => `${field.name}${fieldModules(field).length > 1 ? '*' : ''}`, installedNote);
+    if (hiddenFields > 0) lines.push(`  ${hiddenHint(hiddenFields, 'raise --limit or narrow with --module')}`);
+    const multiDefiners = fields.filter((field) => fieldModules(field).length > 1);
+    if (multiDefiners.length > 0) {
+      lines.push(`* defined in more than one module: ${multiDefiners.slice(0, limit).map((field) => `${field.name} (${fieldModules(field).join(', ')})`).join('; ')}`);
+      if (multiDefiners.length > limit) lines.push(`  ${hiddenHint(multiDefiners.length - limit, 'raise --limit or narrow with --module')}`);
+    }
+    lines.push('methods by module:');
+    const methodGroups = groupByModules(methods, (method) => methodModules(method));
+    const hiddenMethods = groupedLines(lines, methodGroups, limit, (method) => method.name, installedNote);
+    if (hiddenMethods > 0) lines.push(`  ${hiddenHint(hiddenMethods, 'raise --limit or narrow with --module')}`);
+    const filteredLine = installedFilterLine(r.filtered);
+    if (filteredLine !== null) lines.push(filteredLine);
+    for (const w of r.warnings ?? []) lines.push(`WARNING ${w}`);
+  } else if (cmd === 'callers') {
+    const counts = r.counts ?? {};
+    const items = r.items ?? [];
+    const python = counts.python ?? 0;
+    const views = counts.views ?? 0;
+    const serverActions = counts.serverActions ?? 0;
+    // A call whose receiver is a local variable cannot be tied to the model, so the
+    // row is `certain: false`; the count is reported rather than hidden.
+    const uncertain = counts.uncertain ?? items.filter((item) => item.kind === 'python' && item.certain === false).length;
+    lines.push(`${r.model ? `${r.model}.` : ''}${r.method ?? r.name ?? '?'}  ${python} python${uncertain > 0 ? ` (${uncertain} uncertain)` : ''}  ${views} view${views === 1 ? '' : 's'}  ${serverActions} server action${serverActions === 1 ? '' : 's'}`);
+    const shown = items.slice(0, limit);
+    for (const item of shown) {
+      const at = `${item.file}:${item.line}`;
+      if (item.kind === 'python') lines.push(`  ${item.certain === false ? 'python?' : 'python'}\t${item.module}.${item.callerModel ?? item.model ?? '?'}.${item.method ?? r.method ?? ''}\t${at}`);
+      else if (item.kind === 'view') lines.push(`  view\t${item.xmlId}\t${item.tag ?? ''}\t${at}`);
+      else if (item.kind === 'server-action') lines.push(`  action\t${item.xmlId}\t${at}`);
+      else lines.push(`  ${item.kind}\t${item.xmlId ?? ''}\t${at}`);
+    }
+    const hidden = Math.max(items.length, r.total ?? 0) - shown.length;
+    if (hidden > 0) lines.push(hiddenHint(hidden, 'raise --limit'));
+    else if (r.truncated === true) lines.push('… list truncated (raise --limit)');
+    const filteredLine = installedFilterLine(r.filtered);
+    if (filteredLine !== null) lines.push(filteredLine);
+    for (const w of r.warnings ?? []) lines.push(`WARNING ${w}`);
+    // The engine may already explain uncertain rows; never print the caveat twice.
+    const caveatSeen = (r.warnings ?? []).some((w) => String(w).includes('certain=false'));
+    if (uncertain > 0 && !caveatSeen) lines.push(`WARNING ${uncertain} python caller(s) use an unresolved receiver; they are listed with certain=false`);
+  } else if (cmd === 'dupes') {
+    const clusters = r.clusters ?? [];
+    if (clusters.length === 0) {
+      lines.push(`dupes  none at or above ${Number(r.threshold ?? 0.75).toFixed(2)}  (compared ${r.compared ?? 0}, candidates ${r.candidates ?? 0})`);
+    }
+    const shownClusters = clusters.slice(0, limit);
+    for (const cluster of shownClusters) {
+      const methods = cluster.methods ?? [];
+      const size = cluster.size ?? methods.length;
+      lines.push(`dupes  ${Number(cluster.score ?? 0).toFixed(2)}  ${size} method${size === 1 ? '' : 's'}  (${(cluster.models ?? []).join(', ')})`);
+      for (const method of methods) lines.push(`  ${method.model}.${method.name}\t${method.file}:${method.line}\t${method.lines} lines`);
+    }
+    const hidden = Math.max(clusters.length, r.total ?? 0) - shownClusters.length;
+    if (hidden > 0) lines.push(hiddenHint(hidden, 'raise --limit or narrow with --module'));
+    else if (r.truncated === true) lines.push('… list truncated (raise --limit or narrow with --module)');
+    const filteredLine = installedFilterLine(r.filtered);
+    if (filteredLine !== null) lines.push(filteredLine);
+    for (const w of r.warnings ?? []) lines.push(`WARNING ${w}`);
+  } else if (cmd === 'similar') {
+    const matches = r.matches ?? [];
+    lines.push(`${r.model}.${r.method}  matches (${matches.length}):`);
+    const shownMatches = matches.slice(0, limit);
+    for (const match of shownMatches) lines.push(`  ${Number(match.score ?? 0).toFixed(2)}\t${match.model}.${match.name}\t${match.file}:${match.line}`);
+    const hidden = Math.max(matches.length, r.total ?? 0) - shownMatches.length;
+    if (hidden > 0) lines.push(hiddenHint(hidden, 'raise --limit or lower --threshold'));
+    else if (r.truncated === true) lines.push('… list truncated (raise --limit or lower --threshold)');
+    const filteredLine = installedFilterLine(r.filtered);
+    if (filteredLine !== null) lines.push(filteredLine);
+    for (const w of r.warnings ?? []) lines.push(`WARNING ${w}`);
   } else if (cmd === 'doctor') {
     lines.push(`odoo-dc ${r.odooDc}  console ${r.consoleVersion}  ${r.node}  base ${r.base}`);
     for (const workspace of r.workspaces ?? []) lines.push(`workspace ${workspace.path}  odoo ${workspace.version ?? 'unknown'}`);
@@ -428,6 +938,9 @@ function toBrief(cmd, r) {
     lines.push(`totals: files ${r.totals.files}  views ${r.totals.views}  actions ${r.totals.actions}  modules ${r.totals.modules}`);
     lines.push(`cache: ${r.cache.dir}  ${r.cache.enabled ? 'on' : 'off'}  ${r.cache.files} file(s)  ${(r.cache.bytes / 1048576).toFixed(1)} MB  (view ${r.cache.viewFiles}, python ${r.cache.pyFiles})`);
     if (r.cache.pruned.files > 0) lines.push(`pruned: ${r.cache.pruned.files} file(s)  ${(r.cache.pruned.bytes / 1048576).toFixed(1)} MB`);
+    const installed = r.installed;
+    if (installed === undefined || installed.source === null) lines.push('installed: unknown (pass --db <name> or --installed <file>)');
+    else lines.push(`installed: ${installed.source === 'db' ? `db ${installed.db ?? '?'}` : `file ${installed.file ?? '?'}`}  ${installed.count} module(s)${installed.error ? `  ERROR ${installed.error}` : ''}`);
     for (const warning of r.warnings) lines.push(`WARNING ${warning}`);
   } else if (cmd === 'related') {
     const tgt = r.target ?? {};
@@ -443,7 +956,7 @@ function toBrief(cmd, r) {
     for (const w of r.warnings ?? []) lines.push(`WARNING ${w}`);
   } else if (cmd === 'access') {
     for (const i of r.items ?? []) lines.push([i.kind === 'artifact' ? i.artifact : i.kind, i.id, i.name !== i.id ? i.name : '', i.detail].join('\t'));
-    if (r.truncated) lines.push(`… ${r.total} total`);
+    if (r.truncated) lines.push(truncationLine(r.total, (r.items ?? []).length, 'raise --limit or narrow with --module'));
     for (const e of r.errors ?? []) lines.push(`ISSUE ${e.file}:${e.line} ${e.message}`);
   } else if (cmd === 'group') {
     lines.push(`${r.group.xmlId}  ${r.group.name}  ${r.group.file}:${r.group.line}`);
@@ -467,7 +980,8 @@ function toBrief(cmd, r) {
     for (const x of r.rules) lines.push(`  ${x.xmlId}\t${x.global ? 'GLOBAL' : x.groups.join(',')}\t${permText(x.perms)}\t${x.domain}`);
     lines.push(`field groups (${(r.fieldGroups ?? []).length}):`);
     for (const f of r.fieldGroups ?? []) lines.push(`  ${f.name}\t${f.groups}\t${f.file}:${f.line}`);
-    lines.push(`used by (${r.used.length}): ${r.used.slice(0, 30).map((u) => `${u.kind}:${u.xmlId}${u.gated ? '*' : ''}`).join(', ')}${r.used.length > 30 ? ', …' : ''}`);
+    lines.push(`used by (${r.used.length}): ${r.used.slice(0, limit).map((u) => `${u.kind}:${u.xmlId}${u.gated ? '*' : ''}`).join(', ') || '-'}`);
+    if (r.used.length > limit) lines.push(`  ${hiddenHint(r.used.length - limit, 'raise --limit')}`);
     for (const w of r.warnings) lines.push(`WARNING ${w.message}`);
   } else if (cmd === 'gate') {
     const a = r.artifact;
@@ -512,7 +1026,7 @@ function formatChoice() {
  * @param {string} base - resolved base directory.
  * @returns {Promise<object>} doctor payload.
  */
-async function doctorReport(engine, roots, base, flags = new Map()) {
+async function doctorReport(engine, roots, base, flags = new Map(), installed = null) {
   const workspaceVersions = new Map();
   for (const root of roots) {
     if (typeof root.workspace === 'string' && root.workspace.length > 0 && !workspaceVersions.has(root.workspace)) {
@@ -586,6 +1100,10 @@ async function doctorReport(engine, roots, base, flags = new Map()) {
   if (totals.failed > 0) warnings.push(`${totals.failed} view file(s) failed to parse`);
   if (totals.skippedData > 0) warnings.push(`${totals.skippedData} data/demo XML file(s) are outside the view index; views declared there read as unknown-view`);
   if (!cache.enabled) warnings.push('the disk cache is off; every run rebuilds the index');
+  // G2: install state is optional, but doctor is where a missing filter must be visible.
+  const installedBlock = installed?.block ?? { source: null, db: null, file: null, count: 0, error: null };
+  if (installedBlock.source === null) warnings.push('install state unknown; pass --db <name> or --installed <file>');
+  else if (installed?.warning !== null) warnings.push(installed.warning);
   let version = 'unknown';
   try {
     version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version ?? 'unknown';
@@ -601,6 +1119,7 @@ async function doctorReport(engine, roots, base, flags = new Map()) {
     roots: rows,
     totals,
     cache: { ...cache, pruned },
+    installed: installedBlock,
     warnings,
   };
 }
@@ -725,6 +1244,16 @@ function batchArgv(item) {
       push(item.model);
       push(item.name);
       break;
+    case 'callers':
+      push(item.model);
+      push(item.name);
+      break;
+    case 'similar':
+      push(item.model);
+      push(item.name);
+      break;
+    case 'dupes':
+      break;
     case 'get':
       push(item.query ?? item.q);
       break;
@@ -753,6 +1282,15 @@ function batchFlags(item, globals) {
   add('step', item.step);
   add('max-methods', item.maxMethods ?? item['max-methods']);
   add('max-files', item.maxFiles ?? item['max-files']);
+  add('modules', item.modules);
+  add('module', item.module);
+  // `module` and `modules` name the same glob list: each command reads the one it documents.
+  if (item.modules !== undefined && item.module === undefined) flags.set('module', [...(flags.get('module') ?? []), String(item.modules)]);
+  if (item.module !== undefined && item.modules === undefined) flags.set('modules', [...(flags.get('modules') ?? []), String(item.module)]);
+  add('threshold', item.threshold);
+  add('min-lines', item.minLines ?? item['min-lines']);
+  add('min-tokens', item.minTokens ?? item['min-tokens']);
+  if (item.installedOnly === true || item['installed-only'] === true) flags.set('installed-only', ['1']);
   if (item.all === true) flags.set('all', ['1']);
   if (item.full === true) flags.set('full', ['1']);
   if (item.refresh === true) flags.set('refresh', ['1']);
@@ -766,7 +1304,7 @@ function batchFlags(item, globals) {
  * @param {Map<string, string[]>} flags - flags of the batch invocation.
  * @returns {Promise<void>} resolves when every line is written.
  */
-async function runBatch(engine, base, flags) {
+async function runBatch(engine, base, flags, installed = null) {
   const file = flags.get('file')?.at(-1);
   let text;
   if (file !== undefined) {
@@ -806,9 +1344,10 @@ async function runBatch(engine, base, flags) {
     }
     try {
       const argv = batchArgv(item);
-      const out = await runCommand(engine, base, argv[0], argv.slice(1), batchFlags(item, flags));
+      const itemFlags = batchFlags(item, flags);
+      const out = await runCommand(engine, base, argv[0], argv.slice(1), itemFlags, installed);
       const brief = item.format === 'brief' || (item.format === undefined && globalBrief);
-      const textOut = brief ? (out.builder ? builderBrief(out.result) : toBrief(out.cmd, out.result)) : null;
+      const textOut = brief ? (out.builder ? builderBrief(out.result) : toBrief(out.cmd, out.result, itemFlags)) : null;
       const keepMeta = item.meta !== undefined ? item.meta !== false : !globalNoMeta;
       let result = out.result;
       if (textOut === null && !keepMeta) result = stripMeta(result);
@@ -834,20 +1373,23 @@ async function main() {
     process.stdout.write(`${USAGE}\n`);
     return flags.has('help') ? undefined : Promise.reject(usage('no command'));
   }
+  cliFlags = flags;
   const one = (k) => flags.get(k)?.at(-1);
   const base = resolve(one('base') ?? process.env.ODOO_DC_BASE ?? process.cwd());
   const addons = [...(flags.get('addons') ?? []), ...(process.env.ODOO_DC_ADDONS ?? '').split(':').filter(Boolean)].map((p) => resolve(p));
-  const engine = createEngine({ base, roots: addons, diskCache: !flags.has('no-cache'), includeData: flags.has('include-data') });
+  // G2: resolve install state before the engine so every action annotates rows.
+  const installed = resolveInstalled(flags);
+  const engine = createEngine({ base, roots: addons, diskCache: !flags.has('no-cache'), includeData: flags.has('include-data'), installedModules: installed.modules });
   const [cmd, ...args] = pos;
   if (cmd === 'batch') {
     if (flags.has('schema')) {
       process.stdout.write(`${JSON.stringify(BATCH_SCHEMA, null, 2)}\n`);
       return undefined;
     }
-    await runBatch(engine, base, flags);
+    await runBatch(engine, base, flags, installed);
     return undefined;
   }
-  return runCommand(engine, base, cmd, args, flags);
+  return runCommand(engine, base, cmd, args, flags, installed);
 }
 
 /** Short/qualified group id match for the acl filters. */
@@ -884,10 +1426,16 @@ function filterModelTrace(trace, one) {
  * @param {string} cmd - command name.
  * @param {string[]} args - positional arguments.
  * @param {Map<string, string[]>} flags - parsed flags.
+ * @param {{ block: object|null, warning: string|null }|null} installed - G2 resolution to report.
  * @returns {Promise<object>} `{ cmd, result }` (plus `builder` for builder commands).
  */
-async function runCommand(engine, base, cmd, args, flags) {
+async function runCommand(engine, base, cmd, args, flags, installed = null) {
   const one = (k) => flags.get(k)?.at(-1);
+  // Validate the command before roots discovery: a typo is a usage error (exit 2),
+  // not "no addons root" (exit 1), even when run outside an Odoo workspace.
+  if (!COMMANDS.has(cmd) && !isBuilderCommand(cmd, args)) throw usage(`unknown command ${cmd}`);
+  // G2: one facade carries --installed-only into every read (also per batch item).
+  if (flags.has('installed-only')) engine = withOnlyInstalled(engine);
 
   const rootsPayload = await get(engine, 'action=roots');
   if (cmd === 'roots') return { cmd, result: rootsPayload };
@@ -912,7 +1460,8 @@ async function runCommand(engine, base, cmd, args, flags) {
   // Lookup commands try roots in order; an explicit --root (not "all") pins a single root.
   const lookup = want !== undefined && want !== 'all' ? [picked] : roots;
   const scopeParam = one('scope') === 'root' ? '&scope=root' : '';
-  const wrap = (result) => ({ cmd, result });
+  const qp = (key, value) => (value === undefined || value === '' ? '' : `&${key}=${enc(String(value))}`);
+  const wrap = (result) => ({ cmd, result: withInstalled(result, installed) });
 
   if (isBuilderCommand(cmd, args)) {
     const result = await runBuilder({
@@ -922,7 +1471,7 @@ async function runCommand(engine, base, cmd, args, flags) {
   }
 
   switch (cmd) {
-    case 'doctor': return wrap(await doctorReport(engine, allRoots, base, flags));
+    case 'doctor': return wrap(await doctorReport(engine, allRoots, base, flags, installed));
     case 'search': {
       need(1, '<query>');
       const query = args.join(' ');
@@ -986,17 +1535,39 @@ async function runCommand(engine, base, cmd, args, flags) {
     case 'pysearch': {
       need(1, '<query>');
       const query = args.join(' ');
+      const globs = moduleGlobs(one('module'));
+      const applyModuleFilter = (payload) => {
+        if (globs.length === 0) return payload;
+        const items = filterByModule(payload.items ?? [], globs, (m) => [m.module]);
+        return { ...payload, items, moduleFilter: { globs: one('module').split(',').map((glob) => glob.trim()).filter(Boolean) } };
+      };
       const fetchPy = (target) => get(engine, `action=pyindex&root=${enc(target.id)}&q=${enc(query)}${one('type') ? `&type=${enc(one('type'))}` : ''}${limit}${refresh}`);
       const first = await fetchPy(picked);
       if ((first.items ?? []).length === 0 && want === undefined && roots.length > 1) {
         const items = [];
         for (const target of roots) items.push(...((await fetchPy(target)).items ?? []));
-        return wrap({ ...first, items, total: items.length, roots: roots.map((x) => x.label), fallback: true });
+        return wrap(applyModuleFilter({ ...first, items, total: items.length, roots: roots.map((x) => x.label), fallback: true }));
       }
-      return wrap(first);
+      return wrap(applyModuleFilter(first));
     }
-    case 'pymodel': need(1, '<model>'); return wrap(await get(engine, `action=pymodel&${r}&model=${enc(args[0])}`));
+    case 'pymodel': {
+      need(1, '<model>');
+      const payload = await get(engine, `action=pymodel&${r}&model=${enc(args[0])}${scopeParam}`);
+      return wrap(filterPymodel(payload, one('module')));
+    }
     case 'pymethod': need(2, '<model> <name>'); return wrap(await get(engine, `action=pymethod&${r}&model=${enc(args[0])}&name=${enc(args[1])}${one('step') ? `&step=${enc(one('step'))}` : ''}`));
+    case 'callers': {
+      need(1, '<method> (or <model> <method>)');
+      const [model, name] = args.length >= 2 ? [args[0], args[1]] : [undefined, args[0]];
+      return wrap(await get(engine, `action=callers&${r}${qp('name', name)}${qp('model', model)}${limit}${scopeParam}`));
+    }
+    case 'dupes':
+      return wrap(await get(engine, `action=dupes&${r}${qp('modules', one('modules'))}${qp('model', one('model'))}${thresholdParam(one('threshold'))}${qp('minLines', one('min-lines'))}${qp('minTokens', one('min-tokens'))}${limit}${scopeParam}`));
+    case 'similar': {
+      need(1, '<model.method> (or <model> <method>)');
+      const [model, name] = splitModelMethod(args);
+      return wrap(await get(engine, `action=similar&${r}${qp('model', model)}${qp('name', name)}${thresholdParam(one('threshold'))}${limit}${scopeParam}`));
+    }
     case 'access': return wrap(await get(engine, `action=secindex&${r}&q=${enc(args.join(' '))}${one('type') ? `&type=${enc(one('type'))}` : ''}${limit}${scopeParam}${refresh}`));
     case 'group': need(1, '<xmlId>'); return wrap(await get(engine, `action=sectrace&${r}&kind=group&id=${enc(args[0])}${scopeParam}${refresh}`));
     case 'acl': {
@@ -1021,6 +1592,9 @@ function wantsBrief() {
   return formatChoice() === 'brief';
 }
 
+/** Flags of the current invocation; the brief renderer needs `--limit`/`--module`. */
+let cliFlags = new Map();
+
 // A closed pipe (`| head`) is the reader's choice, not a failure.
 process.stdout.on('error', (error) => {
   if (error.code === 'EPIPE') process.exit(0);
@@ -1030,7 +1604,7 @@ process.stdout.on('error', (error) => {
 main().then((out) => {
   if (out === undefined) return;
   const format = formatChoice();
-  const brief = format === 'brief' ? (out.builder ? builderBrief(out.result) : toBrief(out.cmd, out.result)) : null;
+  const brief = format === 'brief' ? (out.builder ? builderBrief(out.result) : toBrief(out.cmd, out.result, cliFlags)) : null;
   const projected = projectResult(out.builder ? out.result : stripMetaForFlags(out.result), out.builder ? [] : cliProjection());
   const text = brief ?? (format === 'compact' ? `${JSON.stringify(projected)}\n` : `${JSON.stringify(projected, null, 2)}\n`);
   const target = outPath();

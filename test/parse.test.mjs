@@ -714,7 +714,10 @@ test('indexViewFile: matches parseViewFile summaries and never builds trees', ()
   assert.equal(index.views.length, full.views.length);
   assert.equal(index.otherRecordCount, full.otherRecordCount);
 
+  // `calls` is the index-time method-call extraction (G3): a bounded list of
+  // {name, tag, type, line} per view, deliberately not the arch tree.
   const summaryKeys = [
+    'calls',
     'fieldText',
     'id',
     'inheritId',
@@ -742,6 +745,10 @@ test('indexViewFile: matches parseViewFile summaries and never builds trees', ()
 
   const formSummary = index.views.find((view) => view.id === 'view_event_form');
   assert.equal(formSummary.fieldText, 'name date_begin ticket_ids');
+  for (const view of index.views) {
+    assert.ok(Array.isArray(view.calls), `${view.id}.calls is a list`);
+    for (const call of view.calls) assert.deepEqual(Object.keys(call).sort(), ['line', 'name', 'tag', 'type']);
+  }
 });
 
 test('indexViewFile: fieldText from arch with 3 fields is "a b c"', () => {

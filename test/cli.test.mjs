@@ -240,11 +240,14 @@ test('193. --fields projects a single command and --no-meta drops global blocks'
   assert.ok(stripped.includes.length > 0, 'the answer itself stays');
 });
 
-test('194. pymodel --format brief lists fields and methods', () => {
+test('194. pymodel --format brief lists fields and methods grouped by module', () => {
   const r = run('pymodel', 'acme.thing', '--format', 'brief');
   assert.equal(r.code, 0);
   assert.match(r.out, /^acme\.thing\s+\d+ fields/);
-  assert.match(r.out, /methods: .*action_reset/);
+  // G7: the brief groups by defining module instead of one flat list.
+  assert.match(r.out, /fields by module:/);
+  assert.match(r.out, /methods by module:/);
+  assert.match(r.out, /acme \(\d+\): .*action_reset/);
 });
 
 test('195. field reports writers from other models (externalWriters)', () => {
