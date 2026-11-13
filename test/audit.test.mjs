@@ -63,6 +63,21 @@ function cliEnv(extra = {}) {
   };
 }
 
+/** Run the CLI over several addons roots of one workspace (search scope cases). */
+function runWorkspace(roots, ...args) {
+  const argv = [CLI];
+  for (const root of roots) argv.push('--addons', root);
+  argv.push('--base', base, ...args);
+  const result = spawnSync(process.execPath, argv, { encoding: 'utf8', env: cliEnv() });
+  let json = null;
+  try {
+    json = JSON.parse(result.stdout);
+  } catch {
+    json = null;
+  }
+  return { ...result, json };
+}
+
 /** Run the CLI against one throwaway root and parse its JSON stdout when it printed any. */
 function runIn(root, ...args) {
   const result = spawnSync(process.execPath, [CLI, '--addons', root, '--base', root, ...args], { encoding: 'utf8', env: cliEnv() });
@@ -83,6 +98,8 @@ before(() => {
   trees.callers = join(base, 'callers-addons');
   trees.dupes = join(base, 'dupes-addons');
   trees.install = join(base, 'install-addons');
+  trees.searchCustom = join(base, 'search-custom');
+  trees.searchCore = join(base, 'search-core');
 
   // G1 + G6/G7: one model across three modules. `amount`/`qty` are declared by
   // acme_a and overridden by acme_b; zeta_mod adds a field only it owns, which is
@@ -313,6 +330,30 @@ class Hidden(models.Model):
 
   // G2: same field and one view per module, so install-state filtering has a
   // definer row and a search hit to drop for acme_b.
+  // Search scope: two addons directories of the same workspace, both holding a
+  // res.partner form view. The custom one answers first, so a per-root search
+  // would return it and stop, hiding the core hit.
+  module(trees.searchCustom, 'acme_shop', {
+    'views/partner.xml': `<odoo><record id="view_partner_form_shop" model="ir.ui.view">
+    <field name="name">res.partner.form.shop</field>
+    <field name="model">res.partner</field>
+    <field name="arch" type="xml"><form><field name="name"/></form></field>
+</record></odoo>
+`,
+  }, ['base']);
+  module(trees.searchCore, 'core_partner', {
+    'views/partner.xml': `<odoo><record id="view_partner_form_core" model="ir.ui.view">
+    <field name="name">res.partner.form.core</field>
+    <field name="model">res.partner</field>
+    <field name="arch" type="xml"><form><field name="name"/></form></field>
+</record><record id="view_partner_tree_core" model="ir.ui.view">
+    <field name="name">res.partner.tree.core</field>
+    <field name="model">res.partner</field>
+    <field name="arch" type="xml"><tree><field name="name"/></tree></field>
+</record></odoo>
+`,
+  }, ['base']);
+
   module(trees.install, 'acme_a', {
     'models/m.py': `from odoo import models, fields
 
@@ -676,5 +717,58 @@ describe('G8 — the odoo-dc shim is discoverable', () => {
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
+  });
+});
+
+describe('Search — the workspace is the scope, not one addons directory', () => {
+  test('a search with no --root merges every root of the workspace and tags each hit', () => {
+    // Gap: the browse search sent one root, so a non-empty custom result hid the
+    // core hit (the CLI only fell back when the first root returned nothing).
+    const result = runWorkspace([trees.searchCustom, trees.searchCore], 'search', 'res.partner form');
+    assert.equal(result.status, 0, result.stderr);
+    const payload = result.json;
+    assert.equal(payload.scope.mode, 'workspace');
+    assert.equal(payload.scope.roots.length, 2);
+    const xmlIds = payload.items.map((item) => item.xmlId);
+    assert.ok(xmlIds.includes('acme_shop.view_partner_form_shop'), xmlIds.join(','));
+    assert.ok(xmlIds.includes('core_partner.view_partner_form_core'), xmlIds.join(','));
+    for (const item of payload.items) {
+      assert.ok(typeof item.rootId === 'string' && item.rootId.length > 0, 'every hit names its root');
+      assert.ok(typeof item.rootLabel === 'string' && item.rootLabel.length > 0, 'every hit carries its root label');
+    }
+    assert.ok(payload.total >= 2, String(payload.total));
+  });
+
+  test('--root pins one addons directory and leaves the scope out', () => {
+    const pinned = runWorkspace([trees.searchCustom, trees.searchCore], 'search', 'res.partner form', '--root', 'search-custom');
+    assert.equal(pinned.status, 0, pinned.stderr);
+    const payload = pinned.json;
+    assert.equal(payload.scope, undefined);
+    assert.deepEqual(payload.items.map((item) => item.xmlId), ['acme_shop.view_partner_form_shop']);
+  });
+
+  test('brief rows carry the root badge of the hit', () => {
+    const brief = runWorkspace([trees.searchCustom, trees.searchCore], 'search', 'res.partner form', '--format', 'brief');
+    assert.equal(brief.status, 0, brief.stderr);
+    const lines = brief.stdout.trim().split('\n');
+    assert.ok(lines.some((line) => line.includes('acme_shop.view_partner_form_shop') && line.endsWith('\tsearch-custom')), brief.stdout);
+    assert.ok(lines.some((line) => line.includes('core_partner.view_partner_form_core') && line.endsWith('\tsearch-core')), brief.stdout);
+  });
+
+  test('window actions use the same workspace scope', () => {
+    module(trees.searchCustom, 'acme_shop', {
+      'views/actions.xml': `<odoo><record id="action_shop_partner" model="ir.actions.act_window">
+    <field name="name">Shop Partners</field>
+    <field name="res_model">res.partner</field>
+    <field name="view_mode">form</field>
+</record></odoo>
+`,
+    }, ['base']);
+    const result = runWorkspace([trees.searchCustom, trees.searchCore], 'actions', 'Partners');
+    assert.equal(result.status, 0, result.stderr);
+    const payload = result.json;
+    assert.equal(payload.scope.mode, 'workspace');
+    assert.ok(payload.items.some((item) => item.xmlId === 'acme_shop.action_shop_partner'), JSON.stringify(payload.items));
+    for (const item of payload.items) assert.ok(typeof item.rootLabel === 'string' && item.rootLabel.length > 0);
   });
 });

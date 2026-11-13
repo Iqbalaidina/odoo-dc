@@ -96,6 +96,9 @@ fall back through every root until the id is found. --root <text> = the one root
 kind contains <text>. --root all = every root.
 Roots default to discovery under --base (default $ODOO_DC_BASE, else the current directory);
 --addons <path> (repeatable, or $ODOO_DC_ADDONS colon list) sets them explicitly.
+Search scope: `search` and `actions` search every addons root of the workspace by default and tag
+each hit with `rootId`/`rootLabel` (brief adds the root as a last column); `--root <text>` pins one
+collection and `--scope root` restores the single-root answer.
 Install state: the index is built from source, so uninstalled modules otherwise look live. --db <name>
 reads the installed module list (ir_module_module.state='installed') through psql; --installed <file>
 reads one module name per line (offline, or without psql); --installed-only drops hits whose module is

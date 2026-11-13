@@ -155,7 +155,13 @@ test('field: definition, views and read/write/depends methods', () => {
 test('--format brief gives one line per hit and rejects unknown formats', () => {
   const r = run('search', 'res.partner form', '--format', 'brief');
   assert.equal(r.code, 0);
-  assert.ok(r.out.trim().split('\n').every((l) => l.split('\t').length === 4), r.out);
+  // A workspace-scoped search tags every hit with its root, so the row is
+  // xmlId, model, type, file:line, root (the last column is the root badge).
+  const lines = r.out.trim().split('\n');
+  assert.ok(lines.length >= 2, r.out);
+  assert.ok(lines.every((l) => l.split('\t').length === 5), r.out);
+  assert.ok(lines.some((l) => l.endsWith('\tcustom-addons')), r.out);
+  assert.ok(lines.some((l) => l.endsWith('\tcore-addons')), r.out);
   assert.equal(run('search', 'x', '--format', 'xml').code, 2);
 });
 

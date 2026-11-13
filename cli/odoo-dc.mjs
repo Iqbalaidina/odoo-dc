@@ -74,8 +74,10 @@ Lookup commands (read-only, JSON on stdout unless --format brief):
                                  group it is granted to; --perm uses letters r/w/c/u, all must
                                  hold). omitted flags keep every row.
 
-Root selection: no --root = first root for search/actions/py*, and view/compose/related/impact/action
-fall back through every root until the id is found. --root <text> = the one root whose label/path/
+Root selection: no --root = the whole workspace for search/actions (every addons directory of it,
+each hit tagged with its root) and for py*; view/compose/related/impact/action fall back through
+every root until the id is found. --root <text> pins one collection, so the search no longer
+crosses into core/base/enterprise. --root <text> = the one root whose label/path/
 kind contains <text>. --root all = every root.
 Roots default to discovery under --base (default $ODOO_DC_BASE, else the current directory);
 --addons <path> (repeatable, or $ODOO_DC_ADDONS colon list) sets them explicitly.
@@ -550,8 +552,8 @@ async function indexOtherRoots(engine, roots, keep) {
 }
 
 /** Search one root; when custom extension views have unresolved types, index the other roots and retry once. */
-async function searchRoot(engine, roots, root, q, type, refresh) {
-  const query = `action=search&root=${enc(root.id)}&q=${enc(q)}${type ? `&type=${enc(type)}` : ''}${refresh}`;
+async function searchRoot(engine, roots, root, q, type, refresh, scope = '') {
+  const query = `action=search&root=${enc(root.id)}&q=${enc(q)}${type ? `&type=${enc(type)}` : ''}${scope}${refresh}`;
   let result = await get(engine, query);
   if ((result.items ?? []).some((v) => v.typeResolved === false && v.inheritId)) {
     await indexOtherRoots(engine, roots, root);
@@ -776,11 +778,11 @@ function toBrief(cmd, r, flags = new Map()) {
   const lines = [];
   const limit = briefLimit(flags);
   if (cmd === 'search') {
-    for (const v of r.items ?? []) lines.push([v.xmlId, v.model, `${v.type}${v.mode === 'extension' ? ' (ext)' : ''}`, `${v.file}:${v.line}`].join('\t'));
+    for (const v of r.items ?? []) lines.push([v.xmlId, v.model, `${v.type}${v.mode === 'extension' ? ' (ext)' : ''}`, `${v.file}:${v.line}`, v.rootLabel ?? ''].filter((part) => part !== '').join('\t'));
     if (r.truncated) lines.push(truncationLine(r.total, (r.items ?? []).length, 'raise --limit'));
     for (const w of r.warnings ?? []) lines.push(`WARNING ${w}`);
   } else if (cmd === 'actions') {
-    for (const a of r.items ?? []) lines.push([a.xmlId, a.resModel, a.viewMode, a.target, a.file].join('\t'));
+    for (const a of r.items ?? []) lines.push([a.xmlId, a.resModel, a.viewMode, a.target, a.file, a.rootLabel ?? ''].filter((part) => part !== '').join('\t'));
     if (r.truncated) lines.push(truncationLine(r.total, (r.items ?? []).length, 'raise --limit'));
     for (const w of r.warnings ?? []) lines.push(`WARNING ${w}`);
   } else if (cmd === 'pysearch') {
@@ -1480,13 +1482,11 @@ async function runCommand(engine, base, cmd, args, flags, installed = null) {
         for (const root of roots) parts.push(await searchRoot(engine, roots, root, query, one('type'), refresh));
         return wrap({ ...searchHealth(parts), items: parts.flatMap((p) => p.items ?? []), truncated: parts.some((p) => p.truncated), roots: roots.map((x) => x.label) });
       }
-      const first = await searchRoot(engine, roots, picked, query, one('type'), refresh);
-      if ((first.items ?? []).length === 0 && want === undefined && roots.length > 1) {
-        const parts = [];
-        for (const root of roots) parts.push(await searchRoot(engine, roots, root, query, one('type'), refresh));
-        return wrap({ ...searchHealth(parts), items: parts.flatMap((p) => p.items ?? []), truncated: parts.some((p) => p.truncated), roots: roots.map((x) => x.label), fallback: true });
-      }
-      return wrap(first);
+      // No --root: the workspace is the scope (every addons directory of it), so a
+      // hit in one collection cannot hide a better hit in another. --root <text>
+      // pins one collection and --scope root asks for the old single-root answer.
+      const workspaceScope = want === undefined && one('scope') !== 'root' ? '&scope=workspace' : '';
+      return wrap(await searchRoot(engine, roots, picked, query, one('type'), refresh, workspaceScope));
     }
     case 'view': {
       need(1, '<xmlId>');
@@ -1512,19 +1512,16 @@ async function runCommand(engine, base, cmd, args, flags, installed = null) {
     case 'impact': need(1, '<xmlId>'); return wrap(await impact(engine, lookup, args[0]));
     case 'actions': {
       const query = args.join(' ');
-      const fetchActions = (target) => get(engine, `action=actions&root=${enc(target.id)}&q=${enc(query)}${one('model') ? `&model=${enc(one('model'))}` : ''}${limit}`);
-      const first = await fetchActions(picked);
-      if ((first.items ?? []).length === 0 && want === undefined && roots.length > 1) {
-        const items = [];
-        let truncated = false;
-        for (const target of roots) {
-          const part = await fetchActions(target);
-          items.push(...(part.items ?? []));
-          if (part.truncated) truncated = true;
-        }
-        return wrap({ ...first, items, total: items.length, truncated, roots: roots.map((x) => x.label), fallback: true });
+      // Same workspace default as `search`; `--root all` merges every root.
+      const scopeParam = want === undefined && one('scope') !== 'root' ? '&scope=workspace' : '';
+      const fetchActions = (target) => get(engine, `action=actions&root=${enc(target.id)}&q=${enc(query)}${one('model') ? `&model=${enc(one('model'))}` : ''}${scopeParam}${limit}`);
+      if (want === 'all') {
+        const parts = [];
+        for (const target of roots) parts.push(await get(engine, `action=actions&root=${enc(target.id)}&q=${enc(query)}${one('model') ? `&model=${enc(one('model'))}` : ''}${limit}`));
+        const items = parts.flatMap((part) => part.items ?? []);
+        return wrap({ ...parts[0], items, total: items.length, truncated: parts.some((part) => part.truncated), roots: roots.map((x) => x.label) });
       }
-      return wrap(first);
+      return wrap(await fetchActions(picked));
     }
     case 'action': {
       need(1, '<xmlId>');
