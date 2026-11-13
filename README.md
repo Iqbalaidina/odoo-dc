@@ -42,7 +42,8 @@ Output is JSON on stdout; errors are one JSON object on stderr with exit code 1 
 ## Commands
 
 ```text
-odoo-dc <command> [args] [--root <label|path|all>] [--addons <path>]... [--base <dir>] [--limit n] [--refresh] [--format brief]
+odoo-dc <command> [args] [--root <label|path|all>] [--addons <path>]... [--base <dir>] [--limit n] [--refresh]
+        [--format brief|json|compact] [--fields a,b] [--no-meta] [--include-data] [--no-cache]
 
 Lookup commands (read-only, JSON on stdout unless --format brief):
   roots                          list detected addons roots
@@ -54,19 +55,30 @@ Lookup commands (read-only, JSON on stdout unless --format brief):
                                  cross-root), actions opening it, fields it uses, compose skips
   actions [query] [--model m]    window actions
   action <xmlId>                 one window action (domain, context, target views, source)
-  field <model> <field>          definition, views showing it, methods reading/writing it
-                                 [--max-files n (60)] [--max-methods n (200)]
+  field <model> <field>          definition, views showing it, methods reading/writing it, and
+                                 externalWriters (writers in other models that reach the field
+                                 through a relation)   [--max-files n (60)] [--max-methods n (200)]
   pysearch <query> [--type method|function|model]
   pymodel <model>                fields + methods of a model
   pymethod <model> <name> [--step n]   override chain, super() targets, source
   access [query] [--type group|model|artifact]
                                  search groups, models and gated views/menus/actions (ACL index)
-  group <xmlId>                  group trace: includes / included by, per-model R/W/C/D, record rules,
-                                 everything it gates (short ids resolve when unique)
-  acl <model>                    model trace: ACL per group, record rules, field-level groups, users of the model
+  group <xmlId>                  group trace: includes / included by, per-model R/W/C/D with the
+                                 granting group (models[].via), record rules, everything it gates
+                                 (short ids resolve when unique)
+  acl <model> [--group g] [--granted-to g] [--perm w]
+                                 model trace: ACL per group, record rules, field-level groups, users
+                                 of the model; the filters keep only matching rows
   gate <xmlId>                   view/menu/action trace: gating groups, menu chain, restricted nodes,
                                  each group's permissions on the model   [--scope root = this root only]
   get "<raw query string>"       any read action, e.g. 'action=module&module=sale'
+  batch [--file cmds.json] [--schema]
+                                 many read commands in one process: JSON array (or one object per
+                                 line) of {"id","action",...}; one {"id","ok","result"|"brief"}
+                                 line per item, exit 1 when any failed. Item keys: action + q
+                                 (search-like), xmlId (view/compose/related/impact/action/group/
+                                 gate), model (+field / +name), query (get). Per item: fields
+                                 ("a,b"), meta:false, format:"brief". --schema prints the contract.
 
 Root selection: no --root = first root for search/actions/py*, and view/compose/related/impact/action
 fall back through every root until the id is found. --root <text> = the one root whose label/path/
@@ -74,7 +86,9 @@ kind contains <text>. --root all = every root.
 Roots default to discovery under --base (default $ODOO_DC_BASE, else the current directory);
 --addons <path> (repeatable, or $ODOO_DC_ADDONS colon list) sets them explicitly.
 --format brief prints one line per hit (search, actions, pysearch) or a short text report
-(impact, field, builder). --full keeps wireframe trees (view, compose). --out file writes to a file.
+(view, related, pymethod, pymodel, impact, field, group, acl, gate, builder). --fields a,b projects
+the top-level JSON keys (also per batch item, not applied to brief text); --no-meta drops the global
+stats/errors blocks. --full keeps wireframe trees (view, compose). --out file writes to a file.
 
 Builder (writes only with --apply; default is a dry-run plan with diffs):
   module new <name> --into <addons dir> [--depends base,mail] [--summary s] [--category c] [--application]

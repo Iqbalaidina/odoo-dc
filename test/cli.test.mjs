@@ -209,6 +209,100 @@ test('access commands: search, group, acl and gate traces (read-only, json and b
   assert.equal(readFileSync(join(addons, 'acme', 'security', 'security.xml'), 'utf8'), before, 'read-only');
 });
 
+// ---- 2026-11-13 improvement pass: batch projection, external writers, filters, type chains.
+
+test('192. batch: per-item fields, meta:false, schema contract and unknown-key hint', () => {
+  const schema = JSON.parse(run('batch', '--schema').out);
+  assert.equal(schema.readOnly, true);
+  assert.match(schema.itemKeys.xmlId, /view/);
+  const file = join(base, 'batch-projection.json');
+  writeFileSync(file, JSON.stringify([
+    { id: 'f', action: 'field', model: 'acme.thing', field: 'amount', fields: 'methods' },
+    { id: 'p', action: 'pymodel', model: 'acme.thing', meta: false },
+    { id: 'bad', action: 'view', view: 'acme.form' },
+  ]));
+  const r = run('batch', '--file', file, '--no-meta');
+  assert.equal(r.code, 1, 'one failed item sets exit 1');
+  const lines = r.out.trim().split('\n').map((line) => JSON.parse(line));
+  const byId = Object.fromEntries(lines.map((line) => [line.id, line]));
+  assert.deepEqual(Object.keys(byId.f.result).sort(), ['methods', 'schemaVersion'], 'fields projects the line');
+  assert.equal(byId.p.result.stats, undefined, 'meta:false drops the global stats block');
+  assert.equal(byId.bad.error.code, 'unknown-item-key');
+  assert.match(byId.bad.error.message, /xmlId/);
+  assert.deepEqual(JSON.parse(r.err.trim()), { failed: 1, total: 3 });
+});
+
+test('193. --fields projects a single command and --no-meta drops global blocks', () => {
+  const projected = JSON.parse(run('group', 'group_mgr', '--fields', 'group').out);
+  assert.deepEqual(Object.keys(projected).sort(), ['group', 'schemaVersion']);
+  const stripped = JSON.parse(run('group', 'group_mgr', '--no-meta').out);
+  assert.equal(stripped.stats, undefined);
+  assert.ok(stripped.includes.length > 0, 'the answer itself stays');
+});
+
+test('194. pymodel --format brief lists fields and methods', () => {
+  const r = run('pymodel', 'acme.thing', '--format', 'brief');
+  assert.equal(r.code, 0);
+  assert.match(r.out, /^acme\.thing\s+\d+ fields/);
+  assert.match(r.out, /methods: .*action_reset/);
+});
+
+test('195. field reports writers from other models (externalWriters)', () => {
+  mkdirSync(join(addons, 'acme', 'models'), { recursive: true });
+  writeFileSync(join(addons, 'acme', 'models', 'usage.py'), `from odoo import models, fields
+
+
+class Usage(models.Model):
+    _name = 'acme.usage'
+    _description = 'Usage'
+
+    thing_id = fields.Many2one('acme.thing', string='Thing')
+
+    def _bump(self):
+        self.thing_id.write({'amount': 1})
+`);
+  const j = JSON.parse(run('field', 'acme.thing', 'amount').out);
+  const external = j.externalWriters.find((row) => row.model === 'acme.usage');
+  assert.ok(external, 'writer through the relation field is reported');
+  assert.equal(external.method, '_bump');
+  assert.ok(external.roles.includes('write'));
+  assert.ok(j.warnings.some((warning) => /externalWriters/.test(warning)));
+});
+
+test('196. acl filters keep only matching rows', () => {
+  const writeOnly = JSON.parse(run('acl', 'acme.thing', '--perm', 'w').out);
+  assert.deepEqual(writeOnly.groups.map((g) => g.group), ['acme.group_mgr']);
+  assert.deepEqual(writeOnly.filters, { group: null, grantedTo: null, perm: 'w' });
+  const granted = JSON.parse(run('acl', 'acme.thing', '--granted-to', 'group_mgr').out);
+  assert.deepEqual(granted.groups.map((g) => g.group), ['acme.group_mgr', 'acme.group_user']);
+  const one = JSON.parse(run('acl', 'acme.thing', '--group', 'group_user').out);
+  assert.deepEqual(one.groups.map((g) => g.group), ['acme.group_user']);
+  const brief = run('acl', 'acme.thing', '--group', 'group_user', '--format', 'brief');
+  assert.match(brief.out, /also \(1\): acme\.group_mgr/);
+});
+
+test('197. group models carry via provenance (direct and implied)', () => {
+  const j = JSON.parse(run('group', 'group_mgr').out);
+  const thing = j.models.find((row) => row.model === 'acme.thing');
+  assert.ok(thing.via.some((entry) => entry.group === 'acme.group_mgr' && entry.direct === true));
+  assert.ok(thing.via.some((entry) => entry.group === 'acme.group_user' && entry.direct === false));
+  assert.match(run('group', 'group_mgr', '--format', 'brief').out, /via acme\.group_user/);
+});
+
+test('198. extension view type resolves through a chain of extensions', () => {
+  writeFileSync(join(addons, 'acme', 'views', 'chain.xml'), `<odoo>
+  <record id="form_x2" model="ir.ui.view"><field name="name">a.form.x2</field><field name="model">res.partner</field>
+    <field name="inherit_id" ref="acme.form_x"/>
+    <field name="arch" type="xml"><xpath expr="//field[@name='name']" position="after"><field name="phone"/></xpath></field></record>
+</odoo>\n`);
+  const j = JSON.parse(run('view', 'acme.form_x2').out);
+  assert.equal(j.view.type, 'form');
+  assert.equal(j.view.typeResolved, true);
+  const impact = JSON.parse(run('impact', 'acme.form').out);
+  assert.equal(impact.transitive, true);
+  assert.ok(impact.allInheritors.some((v) => v.xmlId === 'acme.form_x2'));
+});
+
 // ---- Builder (the only writing commands): dry-run by default, --apply writes, never overwrites.
 
 function runIn(root, ...args) {

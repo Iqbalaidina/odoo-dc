@@ -44,10 +44,24 @@ Lookup commands (read-only, JSON on stdout unless --format brief):
   gate <xmlId>                   view/menu/action trace: gating groups, menu chain, restricted nodes,
                                  each group's permissions on the model   [--scope root = this root only]
   get "<raw query string>"       any read action, e.g. 'action=module&module=sale'
-  batch [--file cmds.json]       run many read commands in one process: a JSON array (or one
+  batch [--file cmds.json] [--schema]
+                                 run many read commands in one process: a JSON array (or one
                                  object per line) of {"id","action",...} read from stdin or the
                                  file; prints one {"id","ok","result"|"brief"} line per item,
-                                 exit 1 when any item failed. Read-only (no builder commands).
+                                 exit 1 when any item failed, and one {"failed":n,"total":m}
+                                 line on stderr. Read-only (no builder commands). Item keys:
+                                 action plus q/query (search, pysearch, actions, access),
+                                 xmlId (view, compose, related, impact, action, group, gate,
+                                 inheritors), model + field (field), model (pymodel, acl),
+                                 model + name (pymethod), query (get). Per-item options: root,
+                                 limit, type, scope, step, maxMethods, maxFiles, all, full,
+                                 refresh, format ("brief"), fields ("a,b" projection), meta
+                                 (false drops the global stats/errors from that line).
+                                 --schema prints this contract as JSON and writes nothing.
+  acl <model> [--group g] [--granted-to g] [--perm w]
+                                 model trace; the filters keep only matching rows (group or a
+                                 group it is granted to; --perm uses letters r/w/c/u, all must
+                                 hold). omitted flags keep every row.
 
 Root selection: no --root = first root for search/actions/py*, and view/compose/related/impact/action
 fall back through every root until the id is found. --root <text> = the one root whose label/path/
@@ -55,7 +69,10 @@ kind contains <text>. --root all = every root.
 Roots default to discovery under --base (default $ODOO_DC_BASE, else the current directory);
 --addons <path> (repeatable, or $ODOO_DC_ADDONS colon list) sets them explicitly.
 --format brief prints one line per hit (search, actions, pysearch) or a short text report
-(view, related, pymethod, impact, field, builder). --full keeps wireframe trees (view, compose).
+(view, related, pymethod, pymodel, impact, field, group, acl, gate, builder). --full keeps wireframe trees (view, compose).
+--fields a,b projects the top-level JSON keys (also works per batch item); it is not applied to
+--format brief text. --no-meta drops the global stats/errors blocks from JSON results (batch:
+per-item meta:false), so output only carries the answer.
 --out file writes to a file. compose/impact merge at most 400 views per query; the payload sets
 capped=true and impact warns when the cap (or the 200-child related list) truncates.
 
@@ -67,6 +84,50 @@ const READ_ACTIONS = new Set([
   'search', 'compose', 'related', 'inheritors', 'flows', 'modelflows', 'actions', 'action', 'xpath', 'xpathbase', 'secindex', 'sectrace',
 ]);
 
+/** Contract of one `batch` item; printed by `batch --schema` and enforced before execution. */
+const BATCH_SCHEMA = {
+  usage: 'odoo-dc batch [--file cmds.json] [--format brief] [--fields a,b] [--no-meta] [--schema]',
+  readOnly: true,
+  itemKeys: {
+    action: 'required: one read command (search, view, compose, related, impact, action, actions, field, pymodel, pymethod, pysearch, access, group, acl, gate, get, roots, doctor)',
+    id: 'optional line id (defaults to the item index)',
+    q: 'search, pysearch, actions, access: query string (query is an alias)',
+    query: 'get: raw query string; alias of q for search-like commands',
+    xmlId: 'view, compose, related, impact, action, group, gate, inheritors',
+    model: 'field: model name; pymodel, acl: model name; pymethod: model name',
+    field: 'field: field name',
+    name: 'pymethod: method name',
+    root: 'per-item root filter (label, path or id)',
+    limit: 'per-item row limit',
+    type: 'per-item type filter (search, pysearch, access)',
+    scope: 'per-item scope (root | workspace)',
+    step: 'pymethod: override-chain step',
+    maxMethods: 'field: max analysed methods (max-methods is an alias)',
+    maxFiles: 'field: max view files (max-files is an alias)',
+    all: 'boolean: compose every inheritor',
+    full: 'boolean: keep wireframe data',
+    refresh: 'boolean: force a reindex',
+    format: 'brief: render the short text form instead of JSON',
+    fields: 'a,b: top-level projection for this line (a JSON array is accepted too)',
+    meta: 'false: drop the global stats/errors blocks from this line',
+  },
+  unknownKeyPolicy: 'fail the item with a hint (exit 1), never silently ignore it',
+};
+
+/** Parse a `--fields` value (comma string or array) into projection keys. */
+function projectionKeys(value) {
+  if (Array.isArray(value)) return value.map((key) => String(key).trim()).filter(Boolean);
+  if (typeof value !== 'string') return [];
+  return value.split(',').map((key) => key.trim()).filter(Boolean);
+}
+
+/** Drop the global index metadata that every command repeats (stats + ACL parse errors). */
+function stripMeta(result) {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return result;
+  const { stats, errors, ...rest } = result;
+  return rest;
+}
+
 /** Route error codes that mean "not in this root", so the next root may have it. */
 const NOT_FOUND = new Set(['unknown-view', 'unknown-action-record', 'unknown-file', 'unknown-model']);
 
@@ -77,7 +138,7 @@ const permText = (p) => (p ? `${p.read ? 'R' : '-'}${p.write ? 'W' : '-'}${p.cre
 function parseArgs(argv) {
   const pos = [];
   const flags = new Map();
-  const bool = new Set(['refresh', 'all', 'full', 'help', 'no-cache', 'include-data', 'prune', ...BUILDER_BOOL_FLAGS]);
+  const bool = new Set(['refresh', 'all', 'full', 'help', 'no-cache', 'include-data', 'prune', 'schema', 'no-meta', ...BUILDER_BOOL_FLAGS]);
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg.startsWith('--')) {
@@ -185,6 +246,9 @@ async function searchRoot(engine, roots, root, q, type, refresh) {
   return result;
 }
 
+/** Roots whose data/demo skip count was already reported in this process. */
+const warnedDataSkips = new Set();
+
 /** `impact`: all that a change to one view can affect. */
 async function impact(engine, roots, xmlId) {
   const { root, value } = await firstRootWith(roots, `view ${xmlId}`, async (r) => {
@@ -207,7 +271,12 @@ async function impact(engine, roots, xmlId) {
   if (inherited.capped) warnings.push('inheritor list capped at 1000; raise MAX_INHERITORS to see the rest');
   if ((value.duplicateChildren ?? 0) > 0) warnings.push(`${value.duplicateChildren} duplicate module copy(ies) collapsed to one xml id; the child paths list every copy`);
   if ((value.childrenTotal ?? 0) > (value.children ?? []).length) warnings.push(`direct inheritor list capped at ${(value.children ?? []).length} of ${value.childrenTotal}; childrenTotal has the real count`);
-  if ((inherited.skippedDataFiles ?? 0) > 0) warnings.push(`${inherited.skippedDataFiles} data/demo XML file(s) are outside the view index; views declared there are not listed`);
+  if ((inherited.skippedDataFiles ?? 0) > 0 && !warnedDataSkips.has(owner.id)) {
+    // Correctness signal, but it is identical for every impact in one process:
+    // print it once per root per invocation instead of on every batch line.
+    warnedDataSkips.add(owner.id);
+    warnings.push(`${inherited.skippedDataFiles} data/demo XML file(s) are outside the view index; views declared there are not listed`);
+  }
   if (composed.indexHealth?.truncated) warnings.push('the view index for this root hit maxFiles; results can be incomplete');
   if ((composed.indexHealth?.failed ?? 0) > 0) warnings.push(`${composed.indexHealth.failed} view file(s) in this root failed to parse`);
   return {
@@ -221,6 +290,7 @@ async function impact(engine, roots, xmlId) {
     directInheritors: (value.children ?? []).map((c) => c.xmlId),
     directInheritorsTotal: value.childrenTotal ?? (value.children ?? []).length,
     allInheritors: (inherited.inheritors ?? []).map((v) => ({ xmlId: v.xmlId, module: v.module, priority: v.priority, mode: v.mode, file: v.file })),
+    transitive: (inherited.inheritors ?? []).some((v) => !(value.children ?? []).some((c) => c.xmlId === v.xmlId)),
     actions: (value.actions ?? []).map((a) => ({ xmlId: a.xmlId, name: a.name })),
     actionsTotal: value.actionsTotal ?? (value.actions ?? []).length,
     fields: own.view.fields ?? [],
@@ -238,7 +308,7 @@ async function fieldReport(engine, roots, model, field, flags) {
   const first = roots[0];
   const methodLimit = Number.isFinite(requestedMethods) && requestedMethods > 0 ? `&maxMethods=${enc(String(requestedMethods))}` : '';
   // One scoped pass: field definition plus the flow of every method of the model.
-  const flowReport = await get(engine, `action=modelflows&root=${enc(first.id)}&model=${enc(model)}&field=${enc(field)}${methodLimit}`);
+  const flowReport = await get(engine, `action=modelflows&root=${enc(first.id)}&model=${enc(model)}&field=${enc(field)}${methodLimit}&scanWriters=1`);
 
   // Views: search each root by "<model> <field>", then confirm the field is in the view arch.
   const views = [];
@@ -269,8 +339,17 @@ async function fieldReport(engine, roots, model, field, flags) {
   }
 
   const methods = (flowReport.methods ?? []).map((row) => ({ name: row.name, roles: row.roles, module: row.module, file: `${row.file}:${row.line}` }));
+  const externalWriters = (flowReport.externalWriters ?? []).map((row) => ({
+    model: row.model, method: row.name, roles: row.roles, module: row.module, file: `${row.file}:${row.line}`,
+  }));
 
   const warnings = [];
+  if (externalWriters.length > 0) {
+    warnings.push(`writes also come from ${[...new Set(externalWriters.map((row) => row.model))].join(', ')} (relation fields pointing at ${model}); see externalWriters`);
+  }
+  if (methods.every((row) => !(row.roles ?? []).includes('write')) && externalWriters.length === 0) {
+    warnings.push('no writer found among the model methods or through a relation field; env()/search() writes are not scanned');
+  }
   if (viewsTruncated) warnings.push(`view search truncated (max ${maxFiles} files); raise --max-files`);
   if (flowReport.truncated) warnings.push(`only ${flowReport.analysed} of ${flowReport.total} methods analysed; raise --max-methods`);
   for (const warning of flowReport.warnings ?? []) warnings.push(warning);
@@ -289,6 +368,7 @@ async function fieldReport(engine, roots, model, field, flags) {
     computeMethod: flowReport.computeMethod ?? null,
     views,
     methods,
+    externalWriters,
     errors: viewErrors,
     warnings,
   };
@@ -308,7 +388,7 @@ function toBrief(cmd, r) {
   } else if (cmd === 'impact') {
     lines.push(`${r.xmlId}  [${r.type}] ${r.model}  ${r.file}  (root: ${r.root})`);
     lines.push(`parent: ${r.parent ?? '-'}`);
-    lines.push(`inheritors (${r.allInheritors.length}, direct ${r.directInheritors.length}): ${r.allInheritors.map((v) => v.xmlId).join(', ') || '-'}`);
+    lines.push(`inheritors (${r.allInheritors.length}, direct ${r.directInheritors.length}${r.transitive === false ? ', no transitive' : ''}): ${r.allInheritors.map((v) => v.xmlId).join(', ') || '-'}`);
     lines.push(`actions (${r.actionsTotal}): ${r.actions.map((a) => a.xmlId).join(', ') || '-'}`);
     lines.push(`fields (${r.fields.length}): ${r.fields.join(', ')}`);
     for (const s of r.skipped) lines.push(`SKIPPED ${s.xmlId} ${s.reason} ${s.expr}`);
@@ -319,6 +399,10 @@ function toBrief(cmd, r) {
     for (const v of r.views) lines.push(`  ${v.xmlId}\t${v.type}${v.mode === 'extension' ? ' (ext)' : ''}\t${v.file}`);
     lines.push(`methods (${r.methods.length}):`);
     for (const m of r.methods) lines.push(`  ${m.name}\t${m.roles.join('+')}\t${m.file ?? ''}`);
+    if ((r.externalWriters ?? []).length > 0) {
+      lines.push(`external writers (${r.externalWriters.length}):`);
+      for (const m of r.externalWriters) lines.push(`  ${m.model}.${m.method}\t${m.roles.join('+')}\t${m.file ?? ''}`);
+    }
     for (const e of r.errors) lines.push(`ERROR ${e.file ?? e.method}: ${e.error}`);
     for (const w of r.warnings) lines.push(`WARNING ${w}`);
   } else if (cmd === 'view') {
@@ -328,6 +412,12 @@ function toBrief(cmd, r) {
     if ((v.fields ?? []).length > 0) lines.push(`fields: ${(v.fields ?? []).slice(0, 80).join(', ')}`);
     const acts = r.actions ?? [];
     lines.push(`actions (${acts.length}): ${acts.slice(0, 10).map((a) => a.xmlId).join(', ') || '-'}${acts.length > 10 ? ', …' : ''}`);
+  } else if (cmd === 'pymodel') {
+    const fields = (r.fields ?? []).map((f) => f.name ?? f);
+    const methods = (r.methods ?? []).map((m) => m.name ?? m);
+    lines.push(`${r.model}  ${r.fieldCount ?? fields.length} fields  ${methods.length} methods${r.description ? `  ${r.description}` : ''}`);
+    if (fields.length > 0) lines.push(`fields: ${fields.slice(0, 80).join(', ')}${fields.length > 80 ? ', …' : ''}`);
+    if (methods.length > 0) lines.push(`methods: ${methods.slice(0, 80).join(', ')}${methods.length > 80 ? ', …' : ''}`);
   } else if (cmd === 'doctor') {
     lines.push(`odoo-dc ${r.odooDc}  console ${r.consoleVersion}  ${r.node}  base ${r.base}`);
     for (const workspace of r.workspaces ?? []) lines.push(`workspace ${workspace.path}  odoo ${workspace.version ?? 'unknown'}`);
@@ -360,7 +450,10 @@ function toBrief(cmd, r) {
     lines.push(`includes (${r.includes.length}): ${r.includes.map((g) => g.xmlId).join(', ') || '-'}`);
     lines.push(`included by (${r.includedBy.length}): ${r.includedBy.map((g) => g.xmlId).join(', ') || '-'}`);
     lines.push(`models (${r.models.length}):`);
-    for (const m of r.models) lines.push(`  ${m.model}\t${permText(m)}`);
+    for (const m of r.models) {
+      const inheritedFrom = (m.via ?? []).filter((entry) => entry.direct !== true).map((entry) => entry.group);
+      lines.push(`  ${m.model}\t${permText(m)}${inheritedFrom.length > 0 ? `\tvia ${inheritedFrom.join(',')}` : ''}`);
+    }
     lines.push(`rules (${r.rules.direct.length} direct, ${r.rules.inherited.length} inherited):`);
     for (const x of [...r.rules.direct, ...r.rules.inherited]) lines.push(`  ${x.xmlId}\t${x.modelKey}\t${permText(x.perms)}\t${x.domain}`);
     lines.push(`gates (${r.gates.length}):`);
@@ -369,7 +462,7 @@ function toBrief(cmd, r) {
   } else if (cmd === 'acl') {
     lines.push(`${r.model}  (${r.key})`);
     lines.push(`acl (${r.groups.length}):`);
-    for (const g of r.groups) lines.push(`  ${g.global ? '(everyone)' : g.group}\t${permText(g.perms)}${g.grantedAlsoTo.length ? `\talso (${g.grantedAlsoTo.length}): ${g.grantedAlsoTo.slice(0, 5).join(', ')}${g.grantedAlsoTo.length > 5 ? ', …' : ''}` : ''}`);
+    for (const g of r.groups) lines.push(`  ${g.global ? '(everyone)' : g.group}\t${permText(g.perms)}${g.grantedAlsoTo.length ? `\talso (${g.grantedAlsoTo.length}): ${g.grantedAlsoTo.join(', ')}` : ''}`);
     lines.push(`rules (${r.rules.length}):`);
     for (const x of r.rules) lines.push(`  ${x.xmlId}\t${x.global ? 'GLOBAL' : x.groups.join(',')}\t${permText(x.perms)}\t${x.domain}`);
     lines.push(`field groups (${(r.fieldGroups ?? []).length}):`);
@@ -535,17 +628,24 @@ function searchHealth(parts) {
  * @param {object} result - command result.
  * @returns {object} projected result.
  */
-function projectResult(result, allowFields = true) {
+function projectResult(result, keys = []) {
   if (result === null || typeof result !== 'object' || Array.isArray(result)) return result;
   const withSchema = { schemaVersion: 1, ...result };
-  if (!allowFields) return withSchema;
-  const i = process.argv.indexOf('--fields');
-  if (i < 0) return withSchema;
-  const keys = String(process.argv[i + 1] ?? '').split(',').map((key) => key.trim()).filter(Boolean);
   if (keys.length === 0) return withSchema;
   const picked = { schemaVersion: 1 };
   for (const key of keys) if (key in withSchema) picked[key] = withSchema[key];
   return picked;
+}
+
+/** Apply `--no-meta` to a single-command result. */
+function stripMetaForFlags(result) {
+  return process.argv.includes('--no-meta') ? stripMeta(result) : result;
+}
+
+/** `--fields` of the current invocation (batch items have their own). */
+function cliProjection() {
+  const i = process.argv.indexOf('--fields');
+  return i < 0 ? [] : projectionKeys(process.argv[i + 1]);
 }
 
 /** Read all of stdin as UTF-8 text. */
@@ -680,6 +780,9 @@ async function runBatch(engine, base, flags) {
   }
   const items = parseBatchItems(text);
   const globalBrief = wantsBrief();
+  const globalFields = flags.get('fields')?.at(-1);
+  const globalNoMeta = flags.has('no-meta');
+  const allowedKeys = new Set(Object.keys(BATCH_SCHEMA.itemKeys));
   let failures = 0;
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index];
@@ -690,13 +793,28 @@ async function runBatch(engine, base, flags) {
       process.stdout.write(`${JSON.stringify({ id, ok: false, error: { code: 'bad-item', message: 'batch item must be an object' } })}\n`);
       continue;
     }
+    const unknown = Object.keys(item).filter((key) => !allowedKeys.has(key));
+    if (unknown.length > 0) {
+      failures += 1;
+      const hint = unknown.map((key) => {
+        if (key === 'view' || key === 'xmlid') return `${key} → xmlId`;
+        if (key === 'q' || key === 'query') return `${key} is only valid for search-like actions`;
+        return key;
+      }).join(', ');
+      process.stdout.write(`${JSON.stringify({ id, ok: false, ms: Date.now() - started, error: { code: 'unknown-item-key', message: `unknown batch item key(s): ${hint}; run "batch --schema" for the contract` } })}\n`);
+      continue;
+    }
     try {
       const argv = batchArgv(item);
       const out = await runCommand(engine, base, argv[0], argv.slice(1), batchFlags(item, flags));
       const brief = item.format === 'brief' || (item.format === undefined && globalBrief);
       const textOut = brief ? (out.builder ? builderBrief(out.result) : toBrief(out.cmd, out.result)) : null;
+      const keepMeta = item.meta !== undefined ? item.meta !== false : !globalNoMeta;
+      let result = out.result;
+      if (textOut === null && !keepMeta) result = stripMeta(result);
+      if (textOut === null) result = projectResult(result, projectionKeys(item.fields !== undefined ? item.fields : globalFields));
       const line = textOut === null
-        ? { id, ok: true, ms: Date.now() - started, result: out.result }
+        ? { id, ok: true, ms: Date.now() - started, result }
         : { id, ok: true, ms: Date.now() - started, brief: textOut };
       process.stdout.write(`${JSON.stringify(line)}\n`);
     } catch (error) {
@@ -704,7 +822,10 @@ async function runBatch(engine, base, flags) {
       process.stdout.write(`${JSON.stringify({ id, ok: false, ms: Date.now() - started, error: { code: error.code ?? 'failed', message: error.message } })}\n`);
     }
   }
-  if (failures > 0) process.exitCode = 1;
+  if (failures > 0) {
+    process.exitCode = 1;
+    process.stderr.write(`${JSON.stringify({ failed: failures, total: items.length })}\n`);
+  }
 }
 
 async function main() {
@@ -719,10 +840,41 @@ async function main() {
   const engine = createEngine({ base, roots: addons, diskCache: !flags.has('no-cache'), includeData: flags.has('include-data') });
   const [cmd, ...args] = pos;
   if (cmd === 'batch') {
+    if (flags.has('schema')) {
+      process.stdout.write(`${JSON.stringify(BATCH_SCHEMA, null, 2)}\n`);
+      return undefined;
+    }
     await runBatch(engine, base, flags);
     return undefined;
   }
   return runCommand(engine, base, cmd, args, flags);
+}
+
+/** Short/qualified group id match for the acl filters. */
+function groupMatches(xmlId, needle) {
+  if (!needle) return true;
+  const value = String(xmlId ?? '').toLowerCase();
+  const wanted = String(needle).toLowerCase();
+  return value === wanted || value.endsWith(`.${wanted}`) || value.includes(wanted);
+}
+
+/** Keep only ACL rows that match --group / --granted-to / --perm (omitted filters keep everything). */
+function filterModelTrace(trace, one) {
+  if (trace === null || typeof trace !== 'object' || !Array.isArray(trace.groups)) return trace;
+  const group = one('group');
+  const grantedTo = one('granted-to');
+  const perm = String(one('perm') ?? '').toLowerCase().replace(/[^rwcu]/g, '');
+  if (group === undefined && grantedTo === undefined && perm.length === 0) return trace;
+  const ops = { r: 'read', w: 'write', c: 'create', u: 'unlink' };
+  const groups = trace.groups.filter((row) => {
+    const selfMatch = group === undefined || groupMatches(row.group, group);
+    const grantMatch = grantedTo === undefined
+      || groupMatches(row.group, grantedTo)
+      || (row.grantedAlsoTo ?? []).some((granted) => groupMatches(granted, grantedTo));
+    const permMatch = perm.length === 0 || [...perm].every((letter) => row.perms?.[ops[letter]] === true);
+    return selfMatch && grantMatch && permMatch;
+  });
+  return { ...trace, groups, filters: { group: group ?? null, grantedTo: grantedTo ?? null, perm: perm || null } };
 }
 
 /**
@@ -847,7 +999,11 @@ async function runCommand(engine, base, cmd, args, flags) {
     case 'pymethod': need(2, '<model> <name>'); return wrap(await get(engine, `action=pymethod&${r}&model=${enc(args[0])}&name=${enc(args[1])}${one('step') ? `&step=${enc(one('step'))}` : ''}`));
     case 'access': return wrap(await get(engine, `action=secindex&${r}&q=${enc(args.join(' '))}${one('type') ? `&type=${enc(one('type'))}` : ''}${limit}${scopeParam}${refresh}`));
     case 'group': need(1, '<xmlId>'); return wrap(await get(engine, `action=sectrace&${r}&kind=group&id=${enc(args[0])}${scopeParam}${refresh}`));
-    case 'acl': need(1, '<model>'); return wrap(await get(engine, `action=sectrace&${r}&kind=model&id=${enc(args[0])}${scopeParam}${refresh}`));
+    case 'acl': {
+      need(1, '<model>');
+      const trace = await get(engine, `action=sectrace&${r}&kind=model&id=${enc(args[0])}${scopeParam}${refresh}`);
+      return wrap(filterModelTrace(trace, one));
+    }
     case 'gate': need(1, '<xmlId>'); return wrap(await get(engine, `action=sectrace&${r}&kind=artifact&id=${enc(args[0])}${scopeParam}${refresh}`));
     case 'get': need(1, '"<query string>"'); return wrap(await get(engine, `${args[0].includes('root=') ? '' : `${r}&`}${args[0]}`));
     default: throw usage(`unknown command ${cmd}`);
@@ -875,7 +1031,7 @@ main().then((out) => {
   if (out === undefined) return;
   const format = formatChoice();
   const brief = format === 'brief' ? (out.builder ? builderBrief(out.result) : toBrief(out.cmd, out.result)) : null;
-  const projected = projectResult(out.result, !out.builder);
+  const projected = projectResult(out.builder ? out.result : stripMetaForFlags(out.result), out.builder ? [] : cliProjection());
   const text = brief ?? (format === 'compact' ? `${JSON.stringify(projected)}\n` : `${JSON.stringify(projected, null, 2)}\n`);
   const target = outPath();
   if (target !== undefined) {
